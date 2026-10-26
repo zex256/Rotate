@@ -4,21 +4,32 @@ let VIEW_W = 640;
 let VIEW_H = 360;
 let HORIZON = VIEW_H / 4;
 let FOCAL = VIEW_W / 2;
-const TEX_SIZE = 512;
-const TEX_MASK = TEX_SIZE - 1;
 const FIXED = 65536;
+const MAP_SIZE = 512;
+const TILE_SIZE = 16;
+const TILE_MASK = TILE_SIZE - 1;
+const WORLD_SIZE = MAP_SIZE * TILE_SIZE;
+const WORLD_FIXED = WORLD_SIZE * FIXED;
+const WORLD_FIXED_MASK = WORLD_FIXED - 1;
+const COORD_FRACTION_BITS = 3;
+const COORD_TILE_BITS = 4;
+const COORD_MAP_BITS = 9;
+const COORD_FIXED_SHIFT = 16 - COORD_FRACTION_BITS;
+const COORD_MASK = 0xffff;
+const COORD_MAP_MASK = (1 << COORD_MAP_BITS) - 1;
 
-let texture32;
-let textureData;
-let textureRows = 0;
+let mapData;
+let tileData;
+let palette32;
+let mapRows = 0;
 let skyData;
 let rowTable;
-let eyeX = 256;
-let eyeZ = 256;
+let eyeX = 256 * TILE_SIZE * FIXED;
+let eyeZ = 256 * TILE_SIZE * FIXED;
 let yaw = 0;
 let pitch = 0;
-let speed = 8;
-let eyeHeight = 8;
+let speed = 8 * FIXED;
+let eyeHeight = 8 * FIXED;
 let canvasFocused = false;
 let renderMs = 0;
 
@@ -36,19 +47,20 @@ function setup() {
     }
   });
   noSmooth();
-  textureData = new Uint8ClampedArray(TEX_SIZE * TEX_SIZE * 4);
-  texture32 = new Uint32Array(textureData.buffer, textureData.byteOffset, textureData.byteLength / 4);
+  palette32 = makePalette();
+  tileData = makeTiles();
+  mapData = new Uint8Array(MAP_SIZE * MAP_SIZE);
   rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
   skyData = makeSky();
   document.getElementById('resolution')?.addEventListener('input', event => {
     setResolution(RESOLUTIONS[Number(event.target.value)]);
   });
   document.getElementById('reset')?.addEventListener('click', () => {
-    eyeX = eyeZ = 256;
+    eyeX = eyeZ = 256 * TILE_SIZE * FIXED;
     yaw = 0;
     pitch = 0;
-    speed = 8;
-    eyeHeight = 8;
+    speed = 8 * FIXED;
+    eyeHeight = 8 * FIXED;
     rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
   });
 }
@@ -95,8 +107,8 @@ function makeRowTable(screenHeight, horizon, angle = 0) {
     const down = (y - horizon) * cosPitch - FOCAL * sinPitch;
     if (down <= 0.000001) continue;
     if (firstRow === screenHeight) firstRow = y;
-    inverse[y] = 1 / down;
-    depthRatio[y] = (FOCAL * cosPitch + (y - horizon) * sinPitch) * inverse[y];
+    inverse[y] = Math.round(FIXED / down);
+    depthRatio[y] = Math.round((FOCAL * cosPitch + (y - horizon) * sinPitch) / down * FIXED);
   }
   return { inverse, depthRatio, firstRow, sinPitch, cosPitch };
 }
@@ -107,17 +119,17 @@ function updateCamera(dt, isDown) {
   pitch += ((isDown(40) ? 1 : 0) - (isDown(38) ? 1 : 0)) * 0.5 * dt;
   pitch = Math.max(-Math.PI / 2, Math.min(Math.PI * 0.39, pitch));
   if (pitch !== oldPitch) rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
-  speed += ((isDown(87) ? 1 : 0) - (isDown(83) ? 1 : 0)) * 20 * dt;
-  speed = Math.max(-400, Math.min(400, speed));
-  const forward = speed * rowTable.cosPitch * dt;
-  const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * 100 * dt;
+  speed += ((isDown(87) ? 1 : 0) - (isDown(83) ? 1 : 0)) * Math.round(20 * dt * FIXED);
+  speed = Math.max(-400 * FIXED, Math.min(400 * FIXED, speed));
+  const forward = Math.round(speed * rowTable.cosPitch * dt);
+  const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * Math.round(100 * dt * FIXED);
   const sinYaw = Math.sin(yaw);
   const cosYaw = Math.cos(yaw);
-  eyeX += sinYaw * forward + cosYaw * side;
-  eyeZ += cosYaw * forward - sinYaw * side;
-  eyeHeight += speed * rowTable.sinPitch * dt;
-  if (eyeHeight <= 1) {
-    eyeHeight = 1;
+  eyeX = (eyeX + Math.round(sinYaw * forward) + Math.round(cosYaw * side)) & WORLD_FIXED_MASK;
+  eyeZ = (eyeZ + Math.round(cosYaw * forward) - Math.round(sinYaw * side)) & WORLD_FIXED_MASK;
+  eyeHeight += Math.round(speed * rowTable.sinPitch * dt);
+  if (eyeHeight <= FIXED) {
+    eyeHeight = FIXED;
     if (pitch !== 0) {
       pitch = 0;
       rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
@@ -128,31 +140,29 @@ function updateCamera(dt, isDown) {
 
 function draw() {
   const dt = Math.min(deltaTime, 50) / 1000;
-  const { sinYaw, cosYaw } = textureRows === TEX_SIZE
+  const { sinYaw, cosYaw } = mapRows === MAP_SIZE
     ? updateCamera(dt, cameraKeyIsDown)
     : { sinYaw: Math.sin(yaw), cosYaw: Math.cos(yaw) };
-  eyeX = ((eyeX % TEX_SIZE) + TEX_SIZE) % TEX_SIZE;
-  eyeZ = ((eyeZ % TEX_SIZE) + TEX_SIZE) % TEX_SIZE;
 
   const startTime = performance.now();
   loadPixels();
   pixels.set(skyData);
-  if (textureRows < TEX_SIZE) {
-    const endRow = Math.min(textureRows + 8, TEX_SIZE);
-    makeTexture(textureData, textureRows, endRow);
-    textureRows = endRow;
+  if (mapRows < MAP_SIZE) {
+    const endRow = Math.min(mapRows + 8, MAP_SIZE);
+    makeMap(mapData, mapRows, endRow);
+    mapRows = endRow;
     updatePixels();
     const status = document.getElementById('status');
-    if (status) status.textContent = `地上マップを準備しています ${Math.round(textureRows / TEX_SIZE * 100)}%`;
+    if (status) status.textContent = `地上マップを準備しています ${Math.round(mapRows / MAP_SIZE * 100)}%`;
     return;
   }
   const output32 = new Uint32Array(pixels.buffer, pixels.byteOffset, pixels.byteLength / 4);
-  renderGround(output32, texture32, eyeX, eyeZ, sinYaw, cosYaw, eyeHeight, rowTable);
+  renderGround(output32, mapData, tileData, palette32, eyeX, eyeZ, sinYaw, cosYaw, eyeHeight, rowTable);
   updatePixels();
   renderMs += (performance.now() - startTime - renderMs) * 0.1;
   if ((frameCount & 0xf) === 0) {
     const status = document.getElementById('status');
-    if (status) status.textContent = `速度 ${speed.toFixed(0)} / 高度 ${eyeHeight.toFixed(0)} / ${frameRate().toFixed(0)} fps / 描画 ${renderMs.toFixed(2)} ms`;
+    if (status) status.textContent = `速度 ${(speed / FIXED).toFixed(0)} / 高度 ${(eyeHeight / FIXED).toFixed(0)} / ${frameRate().toFixed(0)} fps / 描画 ${renderMs.toFixed(2)} ms`;
   }
 }
 
@@ -160,64 +170,144 @@ function cameraKeyIsDown(code) {
   return canvasFocused && keyIsDown(code);
 }
 
-function renderGround(output, tex, cameraX, cameraZ, sinYaw, cosYaw, height, table) {
+function renderGround(output, map, tiles, palette, cameraX, cameraZ, sinYaw, cosYaw, height, table) {
   const halfWidth = VIEW_W / 2;
   for (let y = table.firstRow; y < VIEW_H; ++y) {
-    // 参照間隔と前方距離を分け、平面の透視投影を求めます。
-    const sampleStep = height * table.inverse[y];
-    const depth = height * table.depthRatio[y];
-    const left = (0.5 - halfWidth) * sampleStep;
-    let u = Math.round((cameraX + sinYaw * depth + cosYaw * left) * FIXED);
-    let v = Math.round((cameraZ + cosYaw * depth - sinYaw * left) * FIXED);
-    const du = Math.round(cosYaw * sampleStep * FIXED);
-    const dv = Math.round(-sinYaw * sampleStep * FIXED);
+    // 固定小数点の係数で、行頭の位置と画素ごとの増分を求めます。
+    const sampleStep = Math.round(height * table.inverse[y] / FIXED);
+    const depth = Math.round(height * table.depthRatio[y] / FIXED);
+    const left = Math.round((0.5 - halfWidth) * sampleStep);
+    let u = cameraX + Math.round(sinYaw * depth) + Math.round(cosYaw * left);
+    let v = cameraZ + Math.round(cosYaw * depth) - Math.round(sinYaw * left);
+    const du = Math.round(cosYaw * sampleStep);
+    const dv = Math.round(-sinYaw * sampleStep);
     let dst = y * VIEW_W;
     const end = dst + VIEW_W;
 
-    // 画素ごとの乗除算・三角関数・p5.jsのget()/set()は不要です。
+    // 9bitのmap座標、4bitのtile座標、3bitの画素内座標を切り出します。
     for (; dst < end; ++dst) {
-      const src = (((v >> 16) & TEX_MASK) << 9) | ((u >> 16) & TEX_MASK);
-      output[dst] = tex[src];
+      const coordX = (u >>> COORD_FIXED_SHIFT) & COORD_MASK;
+      const coordY = (v >>> COORD_FIXED_SHIFT) & COORD_MASK;
+      const mapX = (coordX >>> (COORD_TILE_BITS + COORD_FRACTION_BITS)) & COORD_MAP_MASK;
+      const mapY = (coordY >>> (COORD_TILE_BITS + COORD_FRACTION_BITS)) & COORD_MAP_MASK;
+      const tileX = (coordX >>> COORD_FRACTION_BITS) & TILE_MASK;
+      const tileY = (coordY >>> COORD_FRACTION_BITS) & TILE_MASK;
+      const tileNumber = map[(mapY << COORD_MAP_BITS) | mapX];
+      const tileIndex = (tileNumber << 8) | (tileY << COORD_TILE_BITS) | tileX;
+      output[dst] = palette[tiles[tileIndex]];
       u += du;
       v += dv;
     }
   }
 }
 
-function makeTexture(data = new Uint8ClampedArray(TEX_SIZE * TEX_SIZE * 4), startRow = 0, endRow = TEX_SIZE) {
-  for (let z = startRow; z < endRow; ++z) {
-    const riverX = 66 + 20 * Math.sin(z * Math.PI * 2 / TEX_SIZE);
-    for (let x = 0; x < TEX_SIZE; ++x) {
-      const grain = ((x * 17 ^ z * 31 ^ (x * z)) & 7) - 3;
-      let color = [94 + grain, 144 + grain, 76 + grain];
+function makePalette() {
+  const colors = [
+    [65, 115, 175],
+    [0, 0, 0], [60, 60, 60], [120, 120, 120], [210, 210, 210], [255, 255, 255],
+    [96, 0, 24], [237, 28, 36], [255, 127, 39], [246, 170, 9], [249, 221, 59],
+    [255, 250, 188], [14, 185, 104], [19, 230, 123], [135, 255, 94], [12, 129, 110],
+    [16, 174, 166], [19, 225, 190], [96, 247, 242], [40, 80, 158], [64, 147, 228],
+    [107, 80, 246], [153, 177, 251], [120, 12, 153], [170, 56, 185], [224, 159, 249],
+    [203, 0, 122], [236, 31, 128], [243, 141, 169], [104, 70, 52], [149, 104, 42], [248, 178, 119]
+  ];
+  const ramps = [
+    [12, 13], [13, 14], [29, 30], [30, 31], [9, 10], [12, 14], [29, 30], [2, 3],
+    [3, 4], [19, 20], [20, 18], [18, 5], [6, 7], [19, 20], [30, 31], [12, 13],
+    [12, 14], [2, 29], [29, 12], [7, 8], [20, 21], [15, 16], [23, 24], [26, 27],
+    [1, 2], [4, 5], [8, 9], [27, 28]
+  ];
+  const bytes = new Uint8ClampedArray(256 * 4);
+  const palette = new Uint32Array(bytes.buffer);
+  for (let color = 0; color < colors.length; ++color) {
+    const index = color * 4;
+    bytes[index] = colors[color][0];
+    bytes[index + 1] = colors[color][1];
+    bytes[index + 2] = colors[color][2];
+    bytes[index + 3] = 255;
+  }
+  for (let ramp = 0; ramp < ramps.length; ++ramp) {
+    const from = colors[ramps[ramp][0]];
+    const to = colors[ramps[ramp][1]];
+    for (let shade = 0; shade < 8; ++shade) {
+      const index = (32 + ramp * 8 + shade) * 4;
+      const amount = shade / 7;
+      bytes[index] = Math.round(from[0] + (to[0] - from[0]) * amount);
+      bytes[index + 1] = Math.round(from[1] + (to[1] - from[1]) * amount);
+      bytes[index + 2] = Math.round(from[2] + (to[2] - from[2]) * amount);
+      bytes[index + 3] = 255;
+    }
+  }
+  return palette;
+}
 
-      // 畑は区画ごとに作物と畝の向きを変えます。
+function makeTiles() {
+  const ramps = [
+    0, 1, 2, 3, 9, 11, 4, 5, 6, 2, 3, 7, 8, 4, 25, 0,
+    18, 15, 16, 1, 12, 13, 14, 19, 8, 25, 10, 20, 21, 22, 23, 17
+  ];
+  const tiles = new Uint8Array(256 * TILE_SIZE * TILE_SIZE);
+  for (let family = 0; family < ramps.length; ++family) {
+    for (let variant = 0; variant < 8; ++variant) {
+      const tileNumber = family * 8 + variant;
+      for (let y = 0; y < TILE_SIZE; ++y) {
+        for (let x = 0; x < TILE_SIZE; ++x) {
+          const noise = (x * 17 ^ y * 31 ^ variant * 13 ^ family * 7) & 7;
+          const direction = variant & 1 ? x : y;
+          let shade = noise;
+          if (family === 1 || family === 3 || family === 10 || family === 12 || family === 24 || family === 25) {
+            shade = (noise + 2) & 7;
+          }
+          if (family === 4 || family === 5) shade = (y + variant + (noise < 2 ? 1 : 0)) & 7;
+          if (family >= 6 && family <= 9) shade = (direction & 7) < 2 ? 1 : 3 + (noise & 3);
+          if (family === 10 && ((x + variant) & 15) < 2) shade = 7;
+          if (family === 11) shade = 2 + (noise & 3);
+          if (family === 13) shade = ((x + variant) & 7) < 4 ? 6 : 2;
+          if (family === 14) shade = ((y + variant * 2) & 7) < 4 ? 7 : 1;
+          if (family === 16) shade = noise < 4 ? 1 : 3;
+          if (family === 17 || family === 18) {
+            const dx = x - (7 + (variant & 1));
+            const dy = y - (7 + ((variant >> 1) & 1));
+            shade = dx * dx + dy * dy < 50 + (variant & 3) * 5 ? (noise < 4 ? 5 : 7) : 1;
+          }
+          if (family >= 20 && family <= 23) shade = (x + y + variant) & 7;
+          if (family === 23 && x > 7) shade = Math.max(0, shade - 3);
+          if (family === 24 && (x < 2 || y < 2)) shade = 7;
+          const paletteIndex = 32 + ramps[family] * 8 + shade;
+          tiles[(tileNumber << 8) | (y << 4) | x] = paletteIndex;
+        }
+      }
+    }
+  }
+  return tiles;
+}
+
+function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRow = MAP_SIZE) {
+  for (let z = startRow; z < endRow; ++z) {
+    const riverX = 66 + 20 * Math.sin(z * Math.PI * 2 / MAP_SIZE);
+    for (let x = 0; x < MAP_SIZE; ++x) {
+      let family = 0;
       if (x >= 112 && x < 216 && (z < 216 || z >= 296)) {
         const field = ((x - 112) >> 5) + (z >> 6);
         const furrow = ((field & 1) ? z : x) & 7;
         const crop = field % 3;
-        color = crop === 0 ? [180, 157, 72] : crop === 1 ? [130, 153, 63] : [153, 111, 69];
-        if (furrow < 2) color = [105, 89, 49];
-        if (((x - 112) & 31) < 2 || (z & 63) < 2) color = [195, 177, 123];
+        family = crop === 0 ? 6 : crop === 1 ? 7 : 8;
+        if (furrow < 2) family = 9;
+        if (((x - 112) & 31) < 2 || (z & 63) < 2) family = 10;
       }
-
-      // 集落の屋根・庭・路地・影を平面の模様として描きます。
       if (x >= 312 && x < 488 && ((z >= 24 && z < 208) || (z >= 312 && z < 488))) {
         const bx = (x - 312) % 44;
         const bz = (z - 4) % 46;
         const block = Math.floor((x - 312) / 44) + Math.floor(z / 46);
-        color = [136 + grain, 159 + grain, 99 + grain];
-        if (bx < 5 || bz < 5) color = [188, 181, 158];
-        if (bx >= 13 && bx < 38 && bz >= 15 && bz < 39) color = [65, 86, 65];
+        family = 15;
+        if (bx < 5 || bz < 5) family = 24;
+        if (bx >= 13 && bx < 38 && bz >= 15 && bz < 39) family = 19;
         if (bx >= 9 && bx < 34 && bz >= 11 && bz < 35) {
-          color = block % 3 === 0 ? [177, 89, 63] : block % 3 === 1 ? [83, 111, 139] : [199, 170, 103];
-          if (bx >= 22) color = color.map(value => value - 28);
-          if (bz === 11 || bx === 9) color = [226, 207, 166];
-          if (bx === 21 || bx === 22) color = [222, 194, 146];
+          family = block % 3 === 0 ? 20 : block % 3 === 1 ? 21 : 22;
+          if (bx >= 22) family = 23;
+          if (bz === 11 || bx === 9 || bx === 21 || bx === 22) family = 24;
         }
       }
-
-      // 川沿いと集落の外側に、位置と大きさの異なる木を配置します。
       if (x < 108 || x >= 488 || (x >= 296 && x < 312)) {
         const cellX = x >> 5;
         const cellZ = z >> 5;
@@ -225,41 +315,36 @@ function makeTexture(data = new Uint8ClampedArray(TEX_SIZE * TEX_SIZE * 4), star
         const tx = (x & 31) - (10 + (hash & 7));
         const tz = (z & 31) - (10 + ((hash >> 3) & 7));
         const radius = 7 + ((hash >> 6) & 3);
-        if ((tx - 3) ** 2 + (tz - 4) ** 2 < radius ** 2) color = [57, 104, 59];
+        if ((tx - 3) ** 2 + (tz - 4) ** 2 < radius ** 2) family = 16;
         if (tx * tx + tz * tz < radius * radius) {
-          color = tx + tz < 0 ? [60, 125, 65] : [40, 92, 54];
-          if ((tx + 2) ** 2 + (tz + 3) ** 2 < 9) color = [91, 151, 74];
+          family = tx + tz < 0 ? 17 : 18;
+          if ((tx + 2) ** 2 + (tz + 3) ** 2 < 9) family = 1;
         }
       }
-
       const riverDistance = Math.abs(x - riverX);
-      if (riverDistance < 17) color = [194, 185, 134];
+      if (riverDistance < 17) family = 3;
       if (riverDistance < 13) {
-        color = [48, 126 + ((x + z) & 7), 164];
-        if (((x + z * 2) & 31) < 2) color = [108, 181, 195];
+        family = 4;
+        if (((x + z * 2) & 31) < 2) family = 5;
       }
-
       const verticalRoad = x >= 232 && x < 280;
       const horizontalRoad = z >= 232 && z < 280;
-      if ((x >= 228 && x < 284) || (z >= 228 && z < 284)) color = [187, 183, 166];
+      if ((x >= 228 && x < 284) || (z >= 228 && z < 284)) family = 12;
       if (verticalRoad || horizontalRoad) {
-        color = [58 + (grain & 1), 65 + (grain & 1), 73 + (grain & 1)];
+        family = 11;
         if (verticalRoad && !horizontalRoad) {
-          if (x < 234 || x >= 278) color = [240, 233, 206];
-          if (x >= 255 && x < 257 && (z & 31) < 18) color = [244, 206, 78];
+          if (x < 234 || x >= 278) family = 12;
+          if (x >= 255 && x < 257 && (z & 31) < 18) family = 13;
         }
         if (horizontalRoad && !verticalRoad) {
-          if (z < 234 || z >= 278) color = [240, 233, 206];
-          if (z >= 255 && z < 257 && (x & 31) < 18) color = [244, 206, 78];
+          if (z < 234 || z >= 278) family = 12;
+          if (z >= 255 && z < 257 && (x & 31) < 18) family = 13;
         }
-        if (verticalRoad && ((z >= 220 && z < 230) || (z >= 282 && z < 292)) && (x & 7) < 4) color = [240, 233, 206];
-        if (horizontalRoad && ((x >= 220 && x < 230) || (x >= 282 && x < 292)) && (z & 7) < 4) color = [240, 233, 206];
+        if (verticalRoad && ((z >= 220 && z < 230) || (z >= 282 && z < 292)) && (x & 7) < 4) family = 14;
+        if (horizontalRoad && ((x >= 220 && x < 230) || (x >= 282 && x < 292)) && (z & 7) < 4) family = 14;
       }
-      const i = (z * TEX_SIZE + x) * 4;
-      data[i] = color[0];
-      data[i + 1] = color[1];
-      data[i + 2] = color[2];
-      data[i + 3] = 255;
+      const variant = ((x * 73 ^ z * 151 ^ family * 31) >>> 0) & 7;
+      data[z * MAP_SIZE + x] = family * 8 + variant;
     }
   }
   return data;
