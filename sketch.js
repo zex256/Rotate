@@ -8,8 +8,9 @@ const FIXED = 65536;
 const MAP_SIZE = 512;
 const TILE_SIZE = 16;
 const TILE_MASK = TILE_SIZE - 1;
-const START_MAP_X = 280;
+const START_MAP_X = 91;
 const START_MAP_Y = 256;
+const START_YAW = Math.PI;
 const WORLD_SIZE = MAP_SIZE * TILE_SIZE;
 const WORLD_FIXED = WORLD_SIZE * FIXED;
 const WORLD_FIXED_MASK = WORLD_FIXED - 1;
@@ -22,6 +23,7 @@ const COORD_MAP_MASK = (1 << COORD_MAP_BITS) - 1;
 const WATER_PALETTE_START = 32 + 25 * 8;
 const WATER_PALETTE_LENGTH = 3 * 8;
 const WATER_FRAME_MS = 80;
+const ASPHALT_FAMILIES = [11, 12, 26, 27];
 
 let mapData;
 let tileData;
@@ -34,10 +36,10 @@ let skyData;
 let rowTable;
 let eyeX = START_MAP_X * TILE_SIZE * FIXED;
 let eyeZ = START_MAP_Y * TILE_SIZE * FIXED;
-let yaw = 0;
+let yaw = START_YAW;
 let pitch = 0;
 let speed = 8 * FIXED;
-let eyeHeight = 8 * FIXED;
+let eyeHeight = 24 * FIXED;
 let canvasFocused = false;
 let renderMs = 0;
 
@@ -67,10 +69,10 @@ function setup() {
   document.getElementById('reset')?.addEventListener('click', () => {
     eyeX = START_MAP_X * TILE_SIZE * FIXED;
     eyeZ = START_MAP_Y * TILE_SIZE * FIXED;
-    yaw = 0;
+    yaw = START_YAW;
     pitch = 0;
     speed = 8 * FIXED;
-    eyeHeight = 8 * FIXED;
+    eyeHeight = 24 * FIXED;
     rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
   });
 }
@@ -125,14 +127,17 @@ function makeRowTable(screenHeight, horizon, angle = 0) {
 
 function updateCamera(dt, isDown) {
   const oldPitch = pitch;
-  yaw += ((isDown(39) ? 1 : 0) - (isDown(37) ? 1 : 0)) * dt;
+  yaw += ((isDown(39) ? 1 : 0) - (isDown(37) ? 1 : 0)) * 1.5 * dt;
   pitch += ((isDown(40) ? 1 : 0) - (isDown(38) ? 1 : 0)) * 0.5 * dt;
   pitch = Math.max(-Math.PI / 2, Math.min(Math.PI * 0.39, pitch));
   if (pitch !== oldPitch) rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
-  speed += ((isDown(87) ? 1 : 0) - (isDown(83) ? 1 : 0)) * Math.round(200 * dt * FIXED);
-  speed = Math.max(-400 * FIXED, Math.min(400 * FIXED, speed));
+  const acceleration = Math.round(50 * dt * FIXED);
+  const braking = Math.round(75 * dt * FIXED);
+  if (isDown(83)) speed = Math.max(0, speed - braking);
+  else if (isDown(87)) speed = Math.min(400 * FIXED, Math.max(0, speed) + acceleration);
+  else speed = Math.max(0, speed);
   const forward = Math.round(speed * rowTable.cosPitch * dt);
-  const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * Math.round(100 * dt * FIXED);
+  const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * Math.round(50 * dt * FIXED);
   const sinYaw = Math.sin(yaw);
   const cosYaw = Math.cos(yaw);
   eyeX = (eyeX + Math.round(sinYaw * forward) + Math.round(cosYaw * side)) & WORLD_FIXED_MASK;
@@ -231,10 +236,10 @@ function makePalette() {
     [203, 0, 122], [236, 31, 128], [243, 141, 169], [104, 70, 52], [149, 104, 42], [248, 178, 119]
   ];
   const ramps = [
-    [12, 13], [13, 14], [29, 30], [30, 31], [9, 10], [12, 14], [29, 30], [2, 3],
+    [12, 13], [13, 14], [29, 30], [30, 31], [9, 10], [12, 14], [29, 30], [3, 4],
     [3, 4], [19, 20], [20, 18], [18, 5], [6, 7], [19, 20], [30, 31], [12, 13],
     [12, 14], [2, 29], [29, 12], [7, 8], [20, 21], [15, 16], [23, 24], [26, 27],
-    [1, 2], [19, 20], [20, 18], [18, 5]
+    [1, 2], [19, 20], [19, 20], [19, 20]
   ];
   const bytes = new Uint8ClampedArray(256 * 4);
   const palette = new Uint32Array(bytes.buffer);
@@ -257,13 +262,23 @@ function makePalette() {
       bytes[index + 3] = 255;
     }
   }
+  const darkBlue = colors[19];
+  const lightBlue = colors[20];
+  for (let i = 0; i < WATER_PALETTE_LENGTH; ++i) {
+    const index = (WATER_PALETTE_START + i) * 4;
+    const amount = 0.5 - 0.5 * Math.cos(i * Math.PI * 2 / WATER_PALETTE_LENGTH);
+    bytes[index] = Math.round(darkBlue[0] + (lightBlue[0] - darkBlue[0]) * amount);
+    bytes[index + 1] = Math.round(darkBlue[1] + (lightBlue[1] - darkBlue[1]) * amount);
+    bytes[index + 2] = Math.round(darkBlue[2] + (lightBlue[2] - darkBlue[2]) * amount);
+    bytes[index + 3] = 255;
+  }
   return palette;
 }
 
 function makeTiles() {
   const ramps = [
-    0, 1, 2, 3, 25, 27, 4, 5, 6, 2, 3, 7, 8, 12, 8, 0,
-    18, 15, 16, 1, 12, 13, 14, 19, 8, 9, 10, 20, 21, 22, 23, 17
+    0, 1, 2, 3, 25, 27, 4, 5, 6, 2, 3, 7, 7, 24, 8, 0,
+    18, 15, 16, 1, 12, 13, 14, 19, 8, 9, 7, 7, 21, 22, 23, 17
   ];
   const tiles = new Uint8Array(256 * TILE_SIZE * TILE_SIZE);
   for (let family = 0; family < ramps.length; ++family) {
@@ -275,14 +290,48 @@ function makeTiles() {
           const direction = variant & 1 ? x : y;
           let shade = noise;
           let ramp = ramps[family];
-          if (family === 1 || family === 3 || family === 10 || family === 12 || family === 24 || family === 25) {
+          const isAsphalt = family === 11 || family === 12 || family === 26 || family === 27;
+          if (family === 0) {
+            const cellX = x >> 2;
+            const cellY = y >> 2;
+            let grassHash = Math.imul(cellX + variant * 17 + 1, 0x45d9f3b)
+              ^ Math.imul(cellY + 1, 0x27d4eb2d);
+            grassHash ^= grassHash >>> 16;
+            const localX = x & 3;
+            const localY = y & 3;
+            const orientation = (grassHash >>> 2) & 3;
+            const start = (grassHash >>> 4) & 1;
+            const length = 2 + ((grassHash >>> 5) & 1);
+            let blade = false;
+            if ((grassHash & 3) !== 0) {
+              if (orientation === 0) {
+                blade = localX === ((grassHash >>> 6) & 3) && localY >= start && localY < start + length;
+              } else if (orientation === 1) {
+                blade = localY === ((grassHash >>> 6) & 3) && localX >= start && localX < start + length;
+              } else if (orientation === 2) {
+                blade = localX === ((localY + ((grassHash >>> 6) & 1)) & 3);
+              } else {
+                blade = localX === ((3 - localY + ((grassHash >>> 6) & 1)) & 3);
+              }
+            }
+            shade = 3 + (noise & 1);
+            if (blade) shade = 5 + ((grassHash >>> 8) & 1);
+          }
+          if (family === 1 || family === 3 || family === 10 || family === 24 || family === 25) {
             shade = (noise + 2) & 7;
           }
           if (family === 4 || family === 5) shade = (y + variant + (noise < 2 ? 1 : 0)) & 7;
           if (family >= 6 && family <= 9) shade = (direction & 7) < 2 ? 1 : 3 + (noise & 3);
           if (family === 10 && ((x + variant) & 15) < 2) shade = 7;
-          if (family === 11) shade = 2 + (noise & 3);
-          if (family === 13) shade = ((direction >> 2) + variant) & 1 ? 7 : 1;
+          if (isAsphalt) {
+            let hash = Math.imul(x + variant * 17 + 1, 0x45d9f3b)
+              ^ Math.imul(y + family * 13 + 1, 0x27d4eb2d);
+            hash ^= hash >>> 16;
+            hash = Math.imul(hash, 0x45d9f3b);
+            hash ^= hash >>> 16;
+            shade = 2 + ((hash >>> ((family & 3) * 3)) % 3);
+          }
+          if (family === 13) shade = 5 + (noise & 2);
           if (family === 14) shade = ((y + variant * 2) & 7) < 4 ? 7 : 1;
           if (family === 16) shade = noise < 4 ? 1 : 3;
           if (family === 17 || family === 18) {
@@ -312,8 +361,18 @@ function makeTiles() {
               }
             }
           }
-          const paletteIndex = 32 + ramp * 8 + shade;
-          tiles[(tileNumber << 8) | (y << 4) | x] = paletteIndex;
+          const tileIndex = (tileNumber << 8) | (y << 4) | x;
+          let paletteIndex = 32 + ramp * 8 + shade;
+          if (isAsphalt && x > 0 && y > 0) {
+            const left = tiles[tileIndex - 1];
+            const above = tiles[tileIndex - TILE_SIZE];
+            const aboveLeft = tiles[tileIndex - TILE_SIZE - 1];
+            if (left === above && above === aboveLeft && paletteIndex === left) {
+              shade = shade === 4 ? 3 : 4;
+              paletteIndex = 32 + ramp * 8 + shade;
+            }
+          }
+          tiles[tileIndex] = paletteIndex;
         }
       }
     }
@@ -321,13 +380,22 @@ function makeTiles() {
   return tiles;
 }
 
+function getCoursePulse(z, center, radius) {
+  let distance = Math.abs(z - center);
+  distance = Math.min(distance, MAP_SIZE - distance);
+  if (distance >= radius) return 0;
+  return 0.5 + 0.5 * Math.cos(Math.PI * distance / radius);
+}
+
+function getTrackHalfWidth(z) {
+  const halfWidth = 4 + 3.8 * getCoursePulse(z, 70, 34) + 4.5 * getCoursePulse(z, 268, 31)
+    - 1.2 * getCoursePulse(z, 134, 25) - 1.4 * getCoursePulse(z, 361, 24);
+  return Math.max(2.24, Math.min(6.8, halfWidth * 0.8));
+}
+
 function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRow = MAP_SIZE) {
   for (let z = startRow; z < endRow; ++z) {
-    const angle = z * Math.PI * 2 / MAP_SIZE;
-    const riverX = 66 + 20 * Math.sin(angle);
-    const trackCenterX = 256 + 86 * Math.sin(angle) + 34 * Math.sin(2 * angle + 0.8);
-    const trackSlope = (86 * Math.cos(angle) + 68 * Math.cos(2 * angle + 0.8)) * Math.PI * 2 / MAP_SIZE;
-    const trackNormalScale = Math.sqrt(1 + trackSlope * trackSlope);
+    const riverX = 66 + 20 * Math.sin(z * Math.PI * 2 / MAP_SIZE);
     for (let x = 0; x < MAP_SIZE; ++x) {
       let family = 0;
       if (x >= 112 && x < 216 && (z < 216 || z >= 296)) {
@@ -370,15 +438,25 @@ function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRo
         family = 4;
         if (((x + z * 2) & 31) < 2) family = 5;
       }
-      const trackOffset = (x - trackCenterX) / trackNormalScale;
-      const trackDistance = Math.abs(trackOffset);
-      if (trackDistance <= 4.5) {
-        family = 11;
+      const dx = x - MAP_SIZE / 2;
+      const dz = z - MAP_SIZE / 2;
+      const angle = (Math.atan2(dz, dx) + Math.PI * 2) % (Math.PI * 2);
+      const radius = Math.sqrt(dx * dx + dz * dz);
+      const cosAngle = Math.cos(angle);
+      const sinAngle = Math.sin(angle);
+      const ellipseRadius = 1 / Math.sqrt(cosAngle * cosAngle / (165 * 165) + sinAngle * sinAngle / (185 * 185));
+      const trackRadius = ellipseRadius + 22 * Math.sin(8 * angle) + 9 * Math.sin(16 * angle + Math.PI);
+      const trackSlope = (176 * Math.cos(8 * angle) + 144 * Math.cos(16 * angle + Math.PI)) / trackRadius;
+      const trackDistance = Math.abs(radius - trackRadius) / Math.sqrt(1 + trackSlope * trackSlope);
+      const trackHalfWidth = getTrackHalfWidth(angle * MAP_SIZE / (Math.PI * 2));
+      if (trackDistance <= trackHalfWidth) {
+        const asphaltHash = (Math.imul(x + 1, 0x45d9f3b) ^ Math.imul(z + 1, 0x27d4eb2d)) >>> 0;
+        family = ASPHALT_FAMILIES[asphaltHash & 3];
         if (z === 0 && (x & 1) === 0) family = 14;
-      } else if (trackDistance <= 5.5) {
+      } else if (trackDistance <= trackHalfWidth + 1.5) {
         family = 25;
-      } else if (trackDistance <= 7.5) {
-        family = 12;
+      } else if (trackDistance <= trackHalfWidth + 3) {
+        family = 13;
       }
       const variant = ((x * 73 ^ z * 151 ^ family * 31) >>> 0) & 7;
       data[z * MAP_SIZE + x] = family * 8 + variant;
