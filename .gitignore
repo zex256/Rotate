@@ -1,0 +1,7 @@
+# Track only the project source files.
+*
+!*/
+!.gitignore
+!/index.html
+!/sketch.js
+!/verify.cjs
