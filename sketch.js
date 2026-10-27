@@ -381,7 +381,7 @@ function makeTiles() {
               if (distance >= 6) ramp = 10;
               const highlightX = 5 + (variant & 1);
               const highlightY = 4 + ((variant >> 1) & 1);
-              if ((x - highlightX) ** 2 + (y - highlightY) ** 2 <= 2) {
+              if (x === highlightX && y === highlightY) {
                 ramp = 11;
                 shade = 7;
               }
