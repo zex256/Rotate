@@ -22,20 +22,40 @@ const COORD_MAP_BITS = 9;
 const COORD_FIXED_SHIFT = 16 - COORD_FRACTION_BITS;
 const COORD_MASK = 0xffff;
 const COORD_MAP_MASK = (1 << COORD_MAP_BITS) - 1;
-// 水面用パレットの範囲と更新間隔、路面用のタイル種類を定義します。
+// 水面と赤系の循環範囲・更新間隔、路面用のタイル種類を定義します。
 const WATER_PALETTE_START = 32 + 25 * 8;
 const WATER_PALETTE_LENGTH = 8;
 const WATER_FRAME_MS = 60;
+const RED_PALETTE_START = 32 + 12 * 8;
+const RED_PALETTE_LENGTH = 8;
+const PALETTE_CYCLES = [
+  [WATER_PALETTE_START, WATER_PALETTE_LENGTH],
+  [RED_PALETTE_START, RED_PALETTE_LENGTH]
+];
+// 球専用の8色は、反射光の白を含めずに深い青と明るい水色の間で変化させます。
+const GLASS_PALETTE_START = 32 + 26 * 8;
+const GLASS_PULSE_MS = WATER_FRAME_MS * 24;
+const GLASS_COLORS = [
+  [8, 30, 94], [10, 43, 119], [13, 58, 145], [18, 77, 169],
+  [27, 98, 192], [40, 121, 213], [60, 146, 231], [88, 173, 245]
+];
+const GLASS_LIGHT_COLORS = [
+  [10, 91, 137], [15, 116, 166], [22, 143, 193], [33, 170, 217],
+  [48, 195, 235], [69, 216, 247], [104, 233, 253], [151, 246, 255]
+];
 const ASPHALT_FAMILIES = [11, 12, 26, 27];
 
 // 地上データ、アニメーションの状態、描画用の表とカメラの状態を保持します。
 let mapData;
 let courseData;
+let sceneryData;
 let courseSeed = DEFAULT_COURSE_SEED;
 let coursePoints = makeCoursePoints(courseSeed);
 let tileData;
 let palette32;
-let waterAnimationMs = 0;
+let paletteBytes;
+let paletteAnimationMs = 0;
+let glassPulseMs = 0;
 let mapRows = 0;
 let skyData;
 let rowTable;
@@ -66,6 +86,7 @@ function setup() {
   noSmooth();
   // パレットとタイルを生成し、マップと描画用データを用意します。
   palette32 = makePalette();
+  paletteBytes = new Uint8ClampedArray(palette32.buffer);
   tileData = makeTiles();
   skyData = makeSky();
   // URLに乱数種があれば、その番号のコースを最初から再現します。
@@ -109,6 +130,7 @@ function regenerateCourse(seed) {
   courseSeed = seed;
   coursePoints = makeCoursePoints(seed);
   courseData = undefined;
+  sceneryData = undefined;
   mapData = new Uint8Array(MAP_SIZE * MAP_SIZE);
   mapRows = 0;
   resetCamera();
@@ -216,19 +238,30 @@ function updateCamera(dt, isDown) {
 }
 
 function draw() {
-  // 経過時間に応じて水面用パレットの色を循環させます。
+  // 経過時間に応じて水面用と赤系のパレットを、それぞれ8色の中で循環させます。
   const dt = Math.min(deltaTime, 50) / 1000;
-  waterAnimationMs += deltaTime;
-  if (waterAnimationMs >= WATER_FRAME_MS) {
-    const steps = Math.floor(waterAnimationMs / WATER_FRAME_MS);
-    waterAnimationMs -= steps * WATER_FRAME_MS;
+  paletteAnimationMs += deltaTime;
+  if (paletteAnimationMs >= WATER_FRAME_MS) {
+    const steps = Math.floor(paletteAnimationMs / WATER_FRAME_MS);
+    paletteAnimationMs -= steps * WATER_FRAME_MS;
     // 最後の色を退避し、[0]→[1]→…→[7]→[0]の順に1段ずつ移します。
-    for (let step = 0; step < steps % WATER_PALETTE_LENGTH; ++step) {
-      const lastColor = palette32[WATER_PALETTE_START + WATER_PALETTE_LENGTH - 1];
-      for (let i = WATER_PALETTE_LENGTH - 1; i > 0; --i) {
-        palette32[WATER_PALETTE_START + i] = palette32[WATER_PALETTE_START + i - 1];
+    for (const [start, length] of PALETTE_CYCLES) {
+      for (let step = 0; step < steps % length; ++step) {
+        const lastColor = palette32[start + length - 1];
+        for (let i = length - 1; i > 0; --i) {
+          palette32[start + i] = palette32[start + i - 1];
+        }
+        palette32[start] = lastColor;
       }
-      palette32[WATER_PALETTE_START] = lastColor;
+    }
+    // 深い青から明るい水色へ、同じ60ms刻みで補間します。反射光や路面は固定です。
+    glassPulseMs = (glassPulseMs + steps * WATER_FRAME_MS) % GLASS_PULSE_MS;
+    const glassBlend = 0.5 - 0.5 * Math.cos(glassPulseMs * Math.PI * 2 / GLASS_PULSE_MS);
+    for (let shade = 0; shade < GLASS_COLORS.length; ++shade) {
+      const index = (GLASS_PALETTE_START + shade) * 4;
+      paletteBytes[index] = Math.round(GLASS_COLORS[shade][0] + (GLASS_LIGHT_COLORS[shade][0] - GLASS_COLORS[shade][0]) * glassBlend);
+      paletteBytes[index + 1] = Math.round(GLASS_COLORS[shade][1] + (GLASS_LIGHT_COLORS[shade][1] - GLASS_COLORS[shade][1]) * glassBlend);
+      paletteBytes[index + 2] = Math.round(GLASS_COLORS[shade][2] + (GLASS_LIGHT_COLORS[shade][2] - GLASS_COLORS[shade][2]) * glassBlend);
     }
   }
   // マップの準備完了後にカメラを更新し、描画用の向きを取得します。
@@ -336,6 +369,14 @@ function makePalette() {
       bytes[index + 3] = 255;
     }
   }
+  // 空いている8パレットをガラス球専用に割り当てます。
+  for (let shade = 0; shade < GLASS_COLORS.length; ++shade) {
+    const index = (GLASS_PALETTE_START + shade) * 4;
+    bytes[index] = GLASS_COLORS[shade][0];
+    bytes[index + 1] = GLASS_COLORS[shade][1];
+    bytes[index + 2] = GLASS_COLORS[shade][2];
+    bytes[index + 3] = 255;
+  }
   return palette;
 }
 
@@ -343,7 +384,7 @@ function makeTiles() {
   // 32種類のタイル群それぞれについて、8種類の模様を生成します。
   const ramps = [
     0, 1, 2, 3, 25, 25, 4, 5, 6, 2, 3, 7, 7, 24, 8, 0,
-    18, 15, 16, 1, 12, 13, 14, 19, 8, 9, 7, 7, 21, 22, 23, 17
+    18, 15, 16, 1, 12, 13, 14, 19, 8, 26, 7, 7, 21, 22, 23, 17
   ];
   const tiles = new Uint8Array(256 * TILE_SIZE * TILE_SIZE);
   for (let family = 0; family < ramps.length; ++family) {
@@ -415,24 +456,24 @@ function makeTiles() {
           if (family >= 20 && family <= 23) shade = (x + y + variant) & 7;
           if (family === 23 && x > 7) shade = Math.max(0, shade - 3);
           if (family === 24 && (x < 2 || y < 2)) shade = 7;
-          // 球の中心からの距離と反射位置でガラス球を描き、周囲を路面色にします。
+          // 半径8の球を16×16ドットの端まで描き、白い反射光を中央寄りに置きます。
           if (family === 25) {
             const dx = x - 7.5;
             const dy = y - 7.5;
             const distanceSquared = dx * dx + dy * dy;
-            if (distanceSquared > 56.25) {
-              ramp = 7;
-              shade = 2 + (noise & 3);
-            } else {
-              const distance = Math.sqrt(distanceSquared);
-              shade = Math.max(1, 7 - Math.floor(distance * 0.72));
-              if (distance >= 6) ramp = 10;
-              const highlightX = 5 + (variant & 1);
-              const highlightY = 4 + ((variant >> 1) & 1);
-              if (x === highlightX && y === highlightY) {
-                ramp = 11;
-                shade = 7;
-              }
+            if (distanceSquared > 64) continue;
+            // 外周の枠は基本色の青20番・紺19番を使い、球本体と一緒に明暗させません。
+            if (distanceSquared >= 49) {
+              tiles[(tileNumber << 8) | (y << 4) | x] = dy < 0 ? 20 : 19;
+              continue;
+            }
+            const distance = Math.sqrt(distanceSquared);
+            shade = Math.max(0, Math.min(7, Math.round(8 - distance - (dx + dy) * 0.16)));
+            const highlightX = 5 + (variant & 1);
+            const highlightY = 5 + ((variant >> 1) & 1);
+            if (x === highlightX && y === highlightY) {
+              ramp = 11;
+              shade = 7;
             }
           }
           const tileIndex = (tileNumber << 8) | (y << 4) | x;
@@ -452,18 +493,35 @@ function makeTiles() {
       }
     }
   }
+  // 全種類の生成後に路面をコピーし、球の外側も同じ3階調の粒状模様にします。
+  for (let variant = 0; variant < 8; ++variant) {
+    const glassOffset = (25 * 8 + variant) << 8;
+    const asphaltOffset = (ASPHALT_FAMILIES[variant & 3] * 8 + variant) << 8;
+    for (let y = 0; y < TILE_SIZE; ++y) {
+      for (let x = 0; x < TILE_SIZE; ++x) {
+        if ((x - 7.5) ** 2 + (y - 7.5) ** 2 > 64) {
+          const pixel = (y << 4) | x;
+          tiles[glassOffset | pixel] = tiles[asphaltOffset | pixel];
+        }
+      }
+    }
+  }
   return tiles;
 }
 
-function makeCoursePoints(seed) {
+function makeRandom(seed) {
   // 32bitの状態だけで乱数を作り、同じ種では同じ順序の値を取り出します。
   let state = seed >>> 0;
-  const random = () => {
+  return () => {
     state = (state + 0x6d2b79f5) | 0;
     let value = Math.imul(state ^ (state >>> 15), state | 1);
     value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
     return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+function makeCoursePoints(seed) {
+  const random = makeRandom(seed);
   const columns = 5 + Math.floor(random() * 3);
   const rows = 5 + Math.floor(random() * 3);
   const cellCount = columns * rows;
@@ -611,58 +669,218 @@ function makeCourse(points = coursePoints) {
   return course;
 }
 
-function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRow = MAP_SIZE) {
-  // コース領域を再利用し、分割生成の各フレームでは曲線を再計算しません。
-  const course = courseData ?? (courseData = makeCourse());
-  // 指定された行の各マスに、地形に応じたタイル番号を設定します。
-  for (let z = startRow; z < endRow; ++z) {
-    const riverX = 66 + 20 * Math.sin(z * Math.PI * 2 / MAP_SIZE);
+function makeLakeSpans(random, size) {
+  // 複数の波を重ねた輪郭で、入り江や半島のある不規則な湖を作ります。
+  const radiusX = size * (0.85 + random() * 0.35);
+  const radiusZ = size * (0.6 + random() * 0.4);
+  const rotation = random() * Math.PI * 2;
+  const phases = [random() * Math.PI * 2, random() * Math.PI * 2, random() * Math.PI * 2];
+  const cos = Math.cos(rotation);
+  const sin = Math.sin(rotation);
+  const points = [];
+  for (let i = 0; i < 64; ++i) {
+    const angle = i * Math.PI * 2 / 64;
+    const radius = 0.9 + 0.3 * Math.sin(3 * angle + phases[0])
+      + 0.2 * Math.sin(5 * angle + phases[1]) + 0.12 * Math.sin(7 * angle + phases[2]);
+    const x = radiusX * radius * Math.cos(angle);
+    const z = radiusZ * radius * Math.sin(angle);
+    points.push([x * cos - z * sin, x * sin + z * cos]);
+  }
+  // 輪郭を走査線ごとの塗りつぶし区間に変換し、配置候補の判定にも再利用します。
+  const minZ = Math.floor(Math.min(...points.map(point => point[1])));
+  const maxZ = Math.ceil(Math.max(...points.map(point => point[1])));
+  const spans = [];
+  for (let z = minZ; z <= maxZ; ++z) {
+    const crossings = [];
+    const sampleZ = z + 0.5;
+    for (let i = 0; i < points.length; ++i) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      if ((a[1] > sampleZ) !== (b[1] > sampleZ)) {
+        crossings.push(a[0] + (sampleZ - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+      }
+    }
+    crossings.sort((a, b) => a - b);
+    for (let i = 0; i + 1 < crossings.length; i += 2) {
+      const left = Math.ceil(crossings[i] - 0.5);
+      const right = Math.floor(crossings[i + 1] - 0.5);
+      if (left <= right) spans.push([z, left, right]);
+    }
+  }
+  return spans;
+}
+
+function isSceneryAreaFree(data, course, x, z, width, height, avoidCourse = true) {
+  // 建物や樹木の全体が乾いた空き地に収まるかを調べます。
+  if (x < 2 || z < 2 || x + width > MAP_SIZE - 2 || z + height > MAP_SIZE - 2) return false;
+  for (let row = z; row < z + height; ++row) {
+    for (let column = x; column < x + width; ++column) {
+      const index = row * MAP_SIZE + column;
+      if (data[index] !== 0 || (avoidCourse && course[index] !== 0)) return false;
+    }
+  }
+  return true;
+}
+
+function makeScenery(seed, course) {
+  // 地上物専用の乱数列を使い、配置を変えてもコースの形は変えません。
+  const random = makeRandom((seed ^ 0xa511e9b3) >>> 0);
+  const data = new Uint8Array(MAP_SIZE * MAP_SIZE);
+  const riverPhase = random() * Math.PI * 2;
+  const ripplePhase = random() * Math.PI * 2;
+  const riverAmplitude = 130 + random() * 25;
+  const rippleAmplitude = 25 + random() * 15;
+  for (let z = 0; z < MAP_SIZE; ++z) {
+    // 大小の蛇行を重ねて川を左右に振り、傾きに応じて川幅を補正します。
+    const riverAngle = z * Math.PI * 2 / MAP_SIZE;
+    const riverX = MAP_SIZE / 2 + riverAmplitude * Math.sin(riverAngle + riverPhase)
+      + rippleAmplitude * Math.sin(2 * riverAngle + ripplePhase);
+    const riverSlope = (riverAmplitude * Math.cos(riverAngle + riverPhase)
+      + 2 * rippleAmplitude * Math.cos(2 * riverAngle + ripplePhase)) * Math.PI * 2 / MAP_SIZE;
+    const riverNormalScale = Math.sqrt(1 + riverSlope * riverSlope);
     for (let x = 0; x < MAP_SIZE; ++x) {
-      let family = 0;
-      // 草地を基本に、畑の区画や畝を配置します。
-      if (x >= 112 && x < 216 && (z < 216 || z >= 296)) {
-        const field = ((x - 112) >> 5) + (z >> 6);
-        const furrow = ((field & 1) ? z : x) & 7;
-        const crop = field % 3;
-        family = crop === 0 ? 6 : crop === 1 ? 7 : 8;
-        if (furrow < 2) family = 9;
-        if (((x - 112) & 31) < 2 || (z & 63) < 2) family = 10;
+      const riverDistance = Math.abs(x - riverX) / riverNormalScale;
+      if (riverDistance < 17) data[z * MAP_SIZE + x] = 3;
+      if (riverDistance < 13) data[z * MAP_SIZE + x] = ((x + z * 2) & 31) < 2 ? 5 : 4;
+    }
+  }
+  // 大きな湖から小さな池まで、既存の水面とつながらない場所へ配置します。
+  for (const size of [68, 46, 30, 18, 10]) {
+    let spans;
+    let minX, maxX, minZ, maxZ;
+    for (let attempt = 0; attempt < 160; ++attempt) {
+      if (attempt % 40 === 0) {
+        spans = makeLakeSpans(random, size * 0.82 ** Math.floor(attempt / 40));
+        minX = Math.min(...spans.map(span => span[1]));
+        maxX = Math.max(...spans.map(span => span[2]));
+        minZ = spans[0][0];
+        maxZ = spans[spans.length - 1][0];
       }
-      // 区画ごとに道、建物、境界を配置します。
-      if (x >= 312 && x < 488 && ((z >= 24 && z < 208) || (z >= 312 && z < 488))) {
-        const bx = (x - 312) % 44;
-        const bz = (z - 4) % 46;
-        const block = Math.floor((x - 312) / 44) + Math.floor(z / 46);
-        family = 15;
-        if (bx < 5 || bz < 5) family = 24;
-        if (bx >= 13 && bx < 38 && bz >= 15 && bz < 39) family = 19;
-        if (bx >= 9 && bx < 34 && bz >= 11 && bz < 35) {
-          family = block % 3 === 0 ? 20 : block % 3 === 1 ? 21 : 22;
-          if (bx >= 22) family = 23;
-          if (bz === 11 || bx === 9 || bx === 21 || bx === 22) family = 24;
+      const lakeX = 4 - minX + Math.floor(random() * (MAP_SIZE - 8 - maxX + minX));
+      const lakeZ = 4 - minZ + Math.floor(random() * (MAP_SIZE - 8 - maxZ + minZ));
+      let free = true;
+      for (const [row, left, right] of spans) {
+        for (let x = left; x <= right; ++x) {
+          if (data[(lakeZ + row) * MAP_SIZE + lakeX + x] !== 0) {
+            free = false;
+            break;
+          }
+        }
+        if (!free) break;
+      }
+      if (!free) continue;
+      for (const [row, left, right] of spans) {
+        const z = lakeZ + row;
+        for (let x = lakeX + left; x <= lakeX + right; ++x) {
+          data[z * MAP_SIZE + x] = ((x + z * 2) & 31) < 2 ? 5 : 4;
         }
       }
-      // 一定の領域に、位置と大きさを変えた樹木を配置します。
-      if (x < 108 || x >= 488 || (x >= 296 && x < 312)) {
-        const cellX = x >> 5;
-        const cellZ = z >> 5;
-        const hash = (cellX * 73 ^ cellZ * 151) >>> 0;
-        const tx = (x & 31) - (10 + (hash & 7));
-        const tz = (z & 31) - (10 + ((hash >> 3) & 7));
-        const radius = 7 + ((hash >> 6) & 3);
-        if ((tx - 3) ** 2 + (tz - 4) ** 2 < radius ** 2) family = 16;
-        if (tx * tx + tz * tz < radius * radius) {
-          family = tx + tz < 0 ? 17 : 18;
-          if ((tx + 2) ** 2 + (tz + 3) ** 2 < 9) family = 1;
+      // 湖岸だけを広げて砂地を作り、深く切れ込んだ水際の形は残します。
+      for (const [row, left, right] of spans) {
+        const z = lakeZ + row;
+        for (let x = lakeX + left; x <= lakeX + right; ++x) {
+          const index = z * MAP_SIZE + x;
+          if (data[index - 1] >= 4 && data[index + 1] >= 4
+            && data[index - MAP_SIZE] >= 4 && data[index + MAP_SIZE] >= 4) continue;
+          for (let dz = -3; dz <= 3; ++dz) {
+            for (let dx = -3; dx <= 3; ++dx) {
+              if (dx * dx + dz * dz > 9) continue;
+              const shore = (z + dz) * MAP_SIZE + x + dx;
+              if (data[shore] === 0) data[shore] = 3;
+            }
+          }
         }
       }
-      // 曲がる川の中心からの距離で、水面と川岸を配置します。
-      const riverDistance = Math.abs(x - riverX);
-      if (riverDistance < 17) family = 3;
-      if (riverDistance < 13) {
-        family = 4;
-        if (((x + z * 2) & 31) < 2) family = 5;
+      break;
+    }
+  }
+  // 畑は区画の位置・大きさ・作物・畝の向きを変えて配置します。
+  const fieldCount = 8 + Math.floor(random() * 4);
+  for (let field = 0; field < fieldCount; ++field) {
+    const width = 24 + Math.floor(random() * 40);
+    const height = 24 + Math.floor(random() * 48);
+    const crop = 6 + Math.floor(random() * 3);
+    const vertical = random() < 0.5;
+    const furrowGap = 6 + Math.floor(random() * 4);
+    for (let attempt = 0; attempt < 64; ++attempt) {
+      const x = 4 + Math.floor(random() * (MAP_SIZE - width - 8));
+      const z = 4 + Math.floor(random() * (MAP_SIZE - height - 8));
+      if (!isSceneryAreaFree(data, course, x, z, width, height, false)) continue;
+      for (let dz = 0; dz < height; ++dz) {
+        for (let dx = 0; dx < width; ++dx) {
+          const border = dx === 0 || dz === 0 || dx === width - 1 || dz === height - 1;
+          data[(z + dz) * MAP_SIZE + x + dx] = border ? 10
+            : (vertical ? dx : dz) % furrowGap === 0 ? 9 : crop;
+        }
       }
+      break;
+    }
+  }
+  // 集落ごとに建物を散らし、建物全体が水面やコースを避けるようにします。
+  const townCount = 3 + Math.floor(random() * 3);
+  for (let town = 0; town < townCount; ++town) {
+    let townX, townZ;
+    for (let attempt = 0; attempt < 32; ++attempt) {
+      townX = 32 + Math.floor(random() * (MAP_SIZE - 64));
+      townZ = 32 + Math.floor(random() * (MAP_SIZE - 64));
+      if (data[townZ * MAP_SIZE + townX] === 0 && course[townZ * MAP_SIZE + townX] === 0) break;
+    }
+    const houseCount = 8 + Math.floor(random() * 7);
+    for (let house = 0; house < houseCount; ++house) {
+      const width = 12 + Math.floor(random() * 11);
+      const height = 12 + Math.floor(random() * 13);
+      const roof = 20 + Math.floor(random() * 3);
+      for (let attempt = 0; attempt < 12; ++attempt) {
+        const x = Math.round(townX + (random() - 0.5) * 140 - width / 2);
+        const z = Math.round(townZ + (random() - 0.5) * 140 - height / 2);
+        if (!isSceneryAreaFree(data, course, x, z, width, height)) continue;
+        for (let dz = 0; dz < height; ++dz) {
+          for (let dx = 0; dx < width; ++dx) {
+            let family = dx === 0 || dz === 0 || dx === width - 1 || dz === height - 1 ? 24 : 15;
+            if (dx >= 2 && dx < width - 2 && dz >= 2 && dz < height - 3) {
+              family = dx >= Math.floor(width * 0.6) ? 23 : roof;
+              if (dx === 2 || dz === 2) family = 24;
+            }
+            data[(z + dz) * MAP_SIZE + x + dx] = family;
+          }
+        }
+        break;
+      }
+    }
+  }
+  // 森の中心も乱数で選び、まとまりと疎らな樹木を混ぜます。
+  const forests = Array.from({ length: 6 + Math.floor(random() * 5) }, () => [
+    16 + random() * (MAP_SIZE - 32), 16 + random() * (MAP_SIZE - 32), 24 + random() * 42
+  ]);
+  const treeAttempts = 500 + Math.floor(random() * 250);
+  for (let tree = 0; tree < treeAttempts; ++tree) {
+    const forest = forests[Math.floor(random() * forests.length)];
+    const scattered = random() < 0.2;
+    const x = Math.round(scattered ? random() * MAP_SIZE : forest[0] + (random() - 0.5) * forest[2] * 2);
+    const z = Math.round(scattered ? random() * MAP_SIZE : forest[1] + (random() - 0.5) * forest[2] * 2);
+    const radius = 3 + Math.floor(random() * 6);
+    if (!isSceneryAreaFree(data, course, x - radius, z - radius, radius * 2 + 4, radius * 2 + 4)) continue;
+    for (let dz = -radius; dz <= radius + 3; ++dz) {
+      for (let dx = -radius; dx <= radius + 3; ++dx) {
+        const index = (z + dz) * MAP_SIZE + x + dx;
+        if ((dx - 2) ** 2 + (dz - 3) ** 2 < radius * radius) data[index] = 16;
+        if (dx * dx + dz * dz < radius * radius) {
+          data[index] = dx + dz < 0 ? 17 : 18;
+          if ((dx + 1) ** 2 + (dz + 1) ** 2 < radius * radius / 9) data[index] = 1;
+        }
+      }
+    }
+  }
+  return data;
+}
+
+function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRow = MAP_SIZE) {
+  // コースと地上物は一度だけ生成し、分割生成の各フレームでは同じ配置を参照します。
+  const course = courseData ?? (courseData = makeCourse());
+  const scenery = sceneryData ?? (sceneryData = makeScenery(courseSeed, course));
+  for (let z = startRow; z < endRow; ++z) {
+    for (let x = 0; x < MAP_SIZE; ++x) {
+      let family = scenery[z * MAP_SIZE + x];
       // 生成済みのコース領域に従い、路面、ガラス球、縁石を配置します。
       const trackLayer = course[z * MAP_SIZE + x];
       if (trackLayer === 1) {
