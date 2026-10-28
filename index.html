@@ -9,8 +9,9 @@
     main { max-width: 1920px; margin: 36px auto; padding: 0 20px; }
     h1 { font-size: 24px; }
     canvas { display: block; height: auto !important; image-rendering: pixelated; }
-    #controls { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; margin: 16px 0; }
+    #controls, #course-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; margin: 16px 0; }
     button, input { font: inherit; }
+    #course-seed { width: 12ch; }
     #status { font-variant-numeric: tabular-nums; }
     small { color: #b4c5d4; }
   </style>
@@ -26,6 +27,12 @@
       <button id="reset" type="button">リセット</button>
       <span id="status"></span>
     </div>
+    <form id="course-controls">
+      <label>乱数種 <input id="course-seed" type="number" min="0" max="4294967295" step="1" value="1" required></label>
+      <button type="submit">コース生成</button>
+      <button id="random-course" type="button">ランダム生成</button>
+    </form>
+    <p>同じ乱数種を指定すると、同じコースを再現できます。表示中の乱数種はURLにも保存されます。</p>
     <p>画面をクリックしてから、↑ / ↓：下向き・上向き、← / →：左右の旋回、A / D：水平の横移動、W：加速、S：ブレーキ、Page Up / Page Down：高度の上げ下げ。カメラの上下角にかかわらず、高度はキーで変更します。</p>
     <p>初期速度は8、高度は24です。Wで加速し、Sを押すと停止まで減速します。停止中は後退しません。キーを離すと速度を維持します。高度の下限は1です。画面からフォーカスが外れても移動は続きます。キー操作は画面にフォーカスがあるときだけ受け付けます。</p>
     <small>急カーブ、広幅・狭幅区間、シケインのあるレースコースを配置。路面は明るいアスファルト、その外側にガラス球と暗い縁石、水面は色が流れる波です。</small>

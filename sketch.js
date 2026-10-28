@@ -10,9 +10,7 @@ const FIXED = 65536;
 const MAP_SIZE = 512;
 const TILE_SIZE = 16;
 const TILE_MASK = TILE_SIZE - 1;
-const START_MAP_X = 91;
-const START_MAP_Y = 256;
-const START_YAW = Math.PI;
+const DEFAULT_COURSE_SEED = 1;
 // ワールドの端を越えた座標は、マスクによって反対側に循環します。
 const WORLD_SIZE = MAP_SIZE * TILE_SIZE;
 const WORLD_FIXED = WORLD_SIZE * FIXED;
@@ -32,15 +30,19 @@ const ASPHALT_FAMILIES = [11, 12, 26, 27];
 
 // 地上データ、アニメーションの状態、描画用の表とカメラの状態を保持します。
 let mapData;
+let courseData;
+let courseSeed = DEFAULT_COURSE_SEED;
+let coursePoints = makeCoursePoints(courseSeed);
 let tileData;
 let palette32;
 let waterAnimationMs = 0;
 let mapRows = 0;
 let skyData;
 let rowTable;
-let eyeX = START_MAP_X * TILE_SIZE * FIXED;
-let eyeZ = START_MAP_Y * TILE_SIZE * FIXED;
-let yaw = START_YAW;
+let eyeX = coursePoints[0][0] * TILE_SIZE * FIXED;
+let eyeZ = coursePoints[0][1] * TILE_SIZE * FIXED;
+let yaw = Math.atan2(coursePoints[1][0] - coursePoints[coursePoints.length - 1][0],
+  coursePoints[1][1] - coursePoints[coursePoints.length - 1][1]);
 let pitch = 0;
 let speed = 8 * FIXED;
 let eyeHeight = 24 * FIXED;
@@ -65,22 +67,68 @@ function setup() {
   // パレットとタイルを生成し、マップと描画用データを用意します。
   palette32 = makePalette();
   tileData = makeTiles();
-  mapData = new Uint8Array(MAP_SIZE * MAP_SIZE);
-  rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
   skyData = makeSky();
+  // URLに乱数種があれば、その番号のコースを最初から再現します。
+  const seedText = new URLSearchParams(globalThis.location?.search ?? '').get('seed');
+  const seed = seedText === null || seedText === '' ? DEFAULT_COURSE_SEED : Number(seedText);
+  regenerateCourse(Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff ? seed : DEFAULT_COURSE_SEED);
   // 解像度の変更とカメラ位置のリセットを画面の操作に結び付けます。
   document.getElementById('resolution')?.addEventListener('input', event => {
     setResolution(RESOLUTIONS[Number(event.target.value)]);
   });
-  document.getElementById('reset')?.addEventListener('click', () => {
-    eyeX = START_MAP_X * TILE_SIZE * FIXED;
-    eyeZ = START_MAP_Y * TILE_SIZE * FIXED;
-    yaw = START_YAW;
-    pitch = 0;
-    speed = 8 * FIXED;
-    eyeHeight = 24 * FIXED;
-    rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
+  document.getElementById('reset')?.addEventListener('click', resetCamera);
+  // 指定番号での再生成と、新しい番号を選ぶランダム生成を受け付けます。
+  const seedInput = document.getElementById('course-seed');
+  document.getElementById('course-controls')?.addEventListener('submit', event => {
+    event.preventDefault();
+    if (seedInput?.reportValidity()) regenerateCourse(Number(seedInput.value));
   });
+  document.getElementById('random-course')?.addEventListener('click', () => {
+    regenerateCourse(Math.floor(Math.random() * 4294967296));
+  });
+}
+
+function resetCamera() {
+  // 生成したコースの開始位置と進行方向にカメラを戻します。
+  const first = coursePoints[0];
+  const next = coursePoints[1];
+  const previous = coursePoints[coursePoints.length - 1];
+  eyeX = first[0] * TILE_SIZE * FIXED;
+  eyeZ = first[1] * TILE_SIZE * FIXED;
+  yaw = Math.atan2(next[0] - previous[0], next[1] - previous[1]);
+  pitch = 0;
+  speed = 8 * FIXED;
+  eyeHeight = 24 * FIXED;
+  rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
+  renderMs = 0;
+}
+
+function regenerateCourse(seed) {
+  // 種を変更したらコースのキャッシュを破棄し、マップを先頭から生成し直します。
+  if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) return;
+  courseSeed = seed;
+  coursePoints = makeCoursePoints(seed);
+  courseData = undefined;
+  mapData = new Uint8Array(MAP_SIZE * MAP_SIZE);
+  mapRows = 0;
+  resetCamera();
+  const seedInput = document.getElementById('course-seed');
+  if (seedInput) seedInput.value = String(seed);
+  const status = document.getElementById('status');
+  if (status) status.textContent = '地上マップを準備しています 0%';
+  // 通常のWebページでは種をURLにも保存し、blob形式のプレビューでは書き換えません。
+  if (seedInput && globalThis.location && typeof globalThis.history?.replaceState === 'function') {
+    const url = new URL(globalThis.location.href);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      url.searchParams.set('seed', String(seed));
+      try {
+        globalThis.history.replaceState(null, '', url);
+      } catch (error) {
+        // iframeなどで履歴操作が制限されていても、コース生成は続けます。
+        if (error.name !== 'SecurityError') throw error;
+      }
+    }
+  }
 }
 
 function setResolution(width) {
@@ -407,22 +455,165 @@ function makeTiles() {
   return tiles;
 }
 
-function getCoursePulse(z, center, radius) {
-  // コース上の指定位置を中心に、幅を滑らかに変える係数を求めます。
-  let distance = Math.abs(z - center);
-  distance = Math.min(distance, MAP_SIZE - distance);
-  if (distance >= radius) return 0;
-  return 0.5 + 0.5 * Math.cos(Math.PI * distance / radius);
+function makeCoursePoints(seed) {
+  // 32bitの状態だけで乱数を作り、同じ種では同じ順序の値を取り出します。
+  let state = seed >>> 0;
+  const random = () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let value = Math.imul(state ^ (state >>> 15), state | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+  const columns = 5 + Math.floor(random() * 3);
+  const rows = 5 + Math.floor(random() * 3);
+  const cellCount = columns * rows;
+  const target = Math.floor(cellCount * (0.7 + random() * 0.25));
+  const visited = new Uint8Array(cellCount);
+  const frontier = [];
+  // 各区画の四隅を小さな輪にし、区画同士の接続時に一つの輪へ結合します。
+  const links = Array.from({ length: cellCount * 4 }, (_, vertex) => {
+    const base = vertex & ~3;
+    return [base + ((vertex + 3) & 3), base + ((vertex + 1) & 3)];
+  });
+  const extendFrontier = cell => {
+    const x = cell % columns;
+    const z = Math.floor(cell / columns);
+    for (const neighbor of [x > 0 ? cell - 1 : -1, x < columns - 1 ? cell + 1 : -1,
+      z > 0 ? cell - columns : -1, z < rows - 1 ? cell + columns : -1]) {
+      if (neighbor >= 0 && !visited[neighbor]) frontier.push([cell, neighbor]);
+    }
+  };
+  const root = (rows - 1) * columns;
+  visited[root] = 1;
+  extendFrontier(root);
+  let selected = 1;
+  while (selected < target && frontier.length > 0) {
+    // 未接続の隣接区画を乱数で選び、交差のない木状の接続を広げます。
+    const index = Math.floor(random() * frontier.length);
+    const [from, to] = frontier[index];
+    frontier[index] = frontier[frontier.length - 1];
+    frontier.pop();
+    if (visited[to]) continue;
+    visited[to] = 1;
+    ++selected;
+    let a, b, c, d;
+    if (Math.floor(from / columns) === Math.floor(to / columns)) {
+      const left = Math.min(from, to) * 4;
+      const right = Math.max(from, to) * 4;
+      [a, b, c, d] = [left + 1, left + 2, right, right + 3];
+    } else {
+      const top = Math.min(from, to) * 4;
+      const bottom = Math.max(from, to) * 4;
+      [a, b, c, d] = [top + 3, top + 2, bottom, bottom + 1];
+    }
+    // 向かい合う辺を開いて結び替え、分岐せずに周回できる経路にします。
+    for (const [vertex, oldNeighbor, newNeighbor] of [[a, b, c], [b, a, d], [c, d, a], [d, c, b]]) {
+      const neighbors = links[vertex];
+      neighbors[neighbors.indexOf(oldNeighbor)] = newNeighbor;
+    }
+    extendFrontier(to);
+  }
+  const spacingX = Math.floor((MAP_SIZE - 96) / (columns * 2 - 1));
+  const spacingZ = Math.floor((MAP_SIZE - 96) / (rows * 2 - 1));
+  const marginX = Math.floor((MAP_SIZE - (columns * 2 - 1) * spacingX) / 2);
+  const marginZ = Math.floor((MAP_SIZE - (rows * 2 - 1) * spacingZ) / 2);
+  const rotation = Math.floor(random() * 4);
+  const mirror = random() < 0.5;
+  const points = [];
+  const firstVertex = root * 4 + 3;
+  let previousVertex = root * 4;
+  let vertex = firstVertex;
+  do {
+    // 区画の輪をたどり、位置・道幅・向きを種に応じて変化させます。
+    const cell = Math.floor(vertex / 4);
+    const corner = vertex & 3;
+    let x = marginX + ((cell % columns) * 2 + (corner === 1 || corner === 2 ? 1 : 0)) * spacingX;
+    let z = marginZ + (Math.floor(cell / columns) * 2 + (corner >= 2 ? 1 : 0)) * spacingZ;
+    const jitterX = Math.floor(random() * 5) - 2;
+    const jitterZ = Math.floor(random() * 5) - 2;
+    const width = 2.75 + Math.floor(random() * 7) * 0.25;
+    const isStartEdge = vertex === firstVertex || vertex === root * 4 + 2;
+    if (!isStartEdge) {
+      x += jitterX;
+      z += jitterZ;
+    }
+    if (mirror) x = MAP_SIZE - x;
+    for (let turn = 0; turn < rotation; ++turn) [x, z] = [MAP_SIZE - z, x];
+    points.push([x, z, isStartEdge ? 4.5 : width]);
+    const nextVertex = links[vertex][0] === previousVertex ? links[vertex][1] : links[vertex][0];
+    previousVertex = vertex;
+    vertex = nextVertex;
+  } while (vertex !== firstVertex);
+  // 開始位置は最初の辺の中央にし、初期の向きを路面の進行方向に合わせます。
+  const first = points.shift();
+  const next = points[0];
+  points.push(first);
+  points.unshift([(first[0] + next[0]) / 2, (first[1] + next[1]) / 2, 4.5]);
+  return points;
 }
 
-function getTrackHalfWidth(z) {
-  // 複数の係数を重ねて、広い区間と狭い区間を作ります。
-  const halfWidth = 4 + 3.8 * getCoursePulse(z, 70, 34) + 4.5 * getCoursePulse(z, 268, 31)
-    - 1.2 * getCoursePulse(z, 134, 25) - 1.4 * getCoursePulse(z, 361, 24);
-  return Math.max(2.24, Math.min(6.8, halfWidth * 0.8));
+function makeCourse(points = coursePoints) {
+  // 曲線の計算は生成時に一度だけ行い、路面・ガラス球・縁石の領域を保存します。
+  const course = new Uint8Array(MAP_SIZE * MAP_SIZE);
+  const count = points.length;
+  for (let point = 0; point < count; ++point) {
+    const p0 = points[(point + count - 1) % count];
+    const p1 = points[point];
+    const p2 = points[(point + 1) % count];
+    const p3 = points[(point + 2) % count];
+    const steps = Math.max(4, Math.ceil(Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) / 2));
+    let previousX = p1[0];
+    let previousZ = p1[1];
+    let previousWidth = p1[2];
+    for (let step = 1; step <= steps; ++step) {
+      // Catmull-Rom曲線で通過点を滑らかにつなぎ、約2マスごとに線分へ分割します。
+      const t = step / steps;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const nextX = 0.5 * (2 * p1[0] + (-p0[0] + p2[0]) * t
+        + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+        + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const nextZ = 0.5 * (2 * p1[1] + (-p0[1] + p2[1]) * t
+        + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+        + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      const nextWidth = p1[2] + (p2[2] - p1[2]) * t;
+      const margin = Math.max(previousWidth, nextWidth) + 3;
+      const minX = Math.max(0, Math.floor(Math.min(previousX, nextX) - margin));
+      const maxX = Math.min(MAP_SIZE - 1, Math.ceil(Math.max(previousX, nextX) + margin));
+      const minZ = Math.max(0, Math.floor(Math.min(previousZ, nextZ) - margin));
+      const maxZ = Math.min(MAP_SIZE - 1, Math.ceil(Math.max(previousZ, nextZ) + margin));
+      const dx = nextX - previousX;
+      const dz = nextZ - previousZ;
+      const lengthSquared = dx * dx + dz * dz;
+      // 線分付近のマスだけを調べ、道幅の変化を補間して各領域を塗ります。
+      for (let z = minZ; z <= maxZ; ++z) {
+        for (let x = minX; x <= maxX; ++x) {
+          const px = x + 0.5 - previousX;
+          const pz = z + 0.5 - previousZ;
+          const along = lengthSquared > 0
+            ? Math.max(0, Math.min(1, (px * dx + pz * dz) / lengthSquared)) : 0;
+          const offsetX = px - along * dx;
+          const offsetZ = pz - along * dz;
+          const distanceSquared = offsetX * offsetX + offsetZ * offsetZ;
+          const width = previousWidth + (nextWidth - previousWidth) * along;
+          const layer = distanceSquared <= width * width ? 1
+            : distanceSquared <= (width + 1.5) ** 2 ? 2
+            : distanceSquared <= (width + 3) ** 2 ? 3 : 0;
+          const index = z * MAP_SIZE + x;
+          if (layer && (course[index] === 0 || layer < course[index])) course[index] = layer;
+        }
+      }
+      previousX = nextX;
+      previousZ = nextZ;
+      previousWidth = nextWidth;
+    }
+  }
+  return course;
 }
 
 function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRow = MAP_SIZE) {
+  // コース領域を再利用し、分割生成の各フレームでは曲線を再計算しません。
+  const course = courseData ?? (courseData = makeCourse());
   // 指定された行の各マスに、地形に応じたタイル番号を設定します。
   for (let z = startRow; z < endRow; ++z) {
     const riverX = 66 + 20 * Math.sin(z * Math.PI * 2 / MAP_SIZE);
@@ -472,26 +663,14 @@ function makeMap(data = new Uint8Array(MAP_SIZE * MAP_SIZE), startRow = 0, endRo
         family = 4;
         if (((x + z * 2) & 31) < 2) family = 5;
       }
-      // 楕円を基準に半径を周期的に変え、マップ内を周回するコースを作ります。
-      const dx = x - MAP_SIZE / 2;
-      const dz = z - MAP_SIZE / 2;
-      const angle = (Math.atan2(dz, dx) + Math.PI * 2) % (Math.PI * 2);
-      const radius = Math.sqrt(dx * dx + dz * dz);
-      const cosAngle = Math.cos(angle);
-      const sinAngle = Math.sin(angle);
-      const ellipseRadius = 1 / Math.sqrt(cosAngle * cosAngle / (165 * 165) + sinAngle * sinAngle / (185 * 185));
-      const trackRadius = ellipseRadius + 22 * Math.sin(8 * angle) + 9 * Math.sin(16 * angle + Math.PI);
-      const trackSlope = (176 * Math.cos(8 * angle) + 144 * Math.cos(16 * angle + Math.PI)) / trackRadius;
-      const trackDistance = Math.abs(radius - trackRadius) / Math.sqrt(1 + trackSlope * trackSlope);
-      const trackHalfWidth = getTrackHalfWidth(angle * MAP_SIZE / (Math.PI * 2));
-      // 中心線からの距離に応じて、路面、ガラス球、縁石を配置します。
-      if (trackDistance <= trackHalfWidth) {
+      // 生成済みのコース領域に従い、路面、ガラス球、縁石を配置します。
+      const trackLayer = course[z * MAP_SIZE + x];
+      if (trackLayer === 1) {
         const asphaltHash = (Math.imul(x + 1, 0x45d9f3b) ^ Math.imul(z + 1, 0x27d4eb2d)) >>> 0;
         family = ASPHALT_FAMILIES[asphaltHash & 3];
-        if (z === 0 && (x & 1) === 0) family = 14;
-      } else if (trackDistance <= trackHalfWidth + 1.5) {
+      } else if (trackLayer === 2) {
         family = 25;
-      } else if (trackDistance <= trackHalfWidth + 3) {
+      } else if (trackLayer === 3) {
         family = 13;
       }
       // 座標に応じた模様の違いを選び、マップにタイル番号を保存します。
