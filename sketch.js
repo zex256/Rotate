@@ -219,7 +219,9 @@ function updateCamera(dt, isDown) {
   else if (isDown(87)) speed = Math.min(400 * FIXED, Math.max(0, speed) + acceleration);
   else speed = Math.max(0, speed);
   // 前進とA/Dの横移動を向きに応じて地上座標に変換します。
-  const forward = Math.round(speed * rowTable.cosPitch * dt);
+  // 上下角による速度補正を戻す場合は、次の式を使用します。
+  // const forward = Math.round(speed * rowTable.cosPitch * dt);
+  const forward = Math.round(speed * dt);
   const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * Math.round(50 * dt * FIXED);
   const sinYaw = Math.sin(yaw);
   const cosYaw = Math.cos(yaw);
