@@ -15,6 +15,35 @@ const DEFAULT_COURSE_SEED = 1;
 const WORLD_SIZE = MAP_SIZE * TILE_SIZE;
 const WORLD_FIXED = WORLD_SIZE * FIXED;
 const WORLD_FIXED_MASK = WORLD_FIXED - 1;
+// 推力は質量で割った加速度です。走行抵抗と二乗抵抗の合計が速度420で推力と釣り合います。
+const ENGINE_ACCELERATION = 100 * FIXED;
+const BRAKE_DECELERATION = 75 * FIXED;
+// 重心移動は押している間だけ横速度を加え、走行速度420で横移動速度140になります。
+const WEIGHT_SHIFT_SPEED_RATIO = 140 / 420;
+const VEHICLE_LEAN_ANGLE = Math.PI / 9;
+const ROLLING_DECELERATION = 8 * FIXED;
+// アクセルを離した間は走行抵抗を強め、加速時とは別に減速の速さを調整します。
+const COAST_DECELERATION = 24 * FIXED;
+const DRAG_COEFFICIENT = (ENGINE_ACCELERATION - ROLLING_DECELERATION) / FIXED / (420 * 420);
+// 横方向の滑りには別の抵抗を掛け、約0.77秒で横速度を半分にします。
+const LATERAL_RESISTANCE = 0.9;
+const STEERING_SPEED = 1.5;
+const PHYSICS_STEP = 1 / 120;
+// カメラは自機の真後ろ32ドットに置き、初期高度24・少し下向きから調整できます。
+const CHASE_DISTANCE = 32 * FIXED;
+const CHASE_HEIGHT = 24 * FIXED;
+const CHASE_PITCH = -0.12;
+// 仮の機体は地上のドット単位で定義し、地面と同じ透視投影で描きます。
+const VEHICLE_PARTS = [
+  { color: [0, 0, 0, 85], height: 0, points: [[0, 4.5], [2.8, 1], [3, -3.5], [0, -4.5], [-3, -3.5], [-2.8, 1]] },
+  { color: [30, 39, 54], height: 1, points: [[0, 4], [2.6, 0.5], [2.8, -3], [0, -4], [-2.8, -3], [-2.6, 0.5]] },
+  { color: [200, 215, 230], height: 1.5, points: [[0, 4], [2.3, 0.5], [2.4, -2.7], [0, -3.4], [-2.4, -2.7], [-2.3, 0.5]] },
+  { color: [225, 64, 76], height: 1.6, points: [[-1.7, 1.2], [-2.3, 0.3], [-2.4, -2.7], [-1.3, -2.3]] },
+  { color: [225, 64, 76], height: 1.6, points: [[1.7, 1.2], [1.3, -2.3], [2.4, -2.7], [2.3, 0.3]] },
+  { color: [30, 80, 122], height: 1.7, points: [[0, 2.2], [0.9, 0.5], [0.7, -1.2], [-0.7, -1.2], [-0.9, 0.5]] },
+  { color: [131, 224, 246], height: 1.8, points: [[0, 1.9], [0.6, 0.5], [-0.6, 0.5]] },
+  { color: [48, 56, 72], height: 1.6, points: [[-1.1, -2.5], [1.1, -2.5], [1.1, -3.2], [-1.1, -3.2]] }
+];
 // 描画時の座標から、マップ9bit・タイル4bit・画素内3bitを取り出します。
 const COORD_FRACTION_BITS = 3;
 const COORD_TILE_BITS = 4;
@@ -45,7 +74,7 @@ const GLASS_LIGHT_COLORS = [
 ];
 const ASPHALT_FAMILIES = [11, 12, 26, 27];
 
-// 地上データ、アニメーションの状態、描画用の表とカメラの状態を保持します。
+// 地上データ、アニメーションの状態、自機と追従カメラの状態を保持します。
 let mapData;
 let courseData;
 let sceneryData;
@@ -59,13 +88,19 @@ let glassPulseMs = 0;
 let mapRows = 0;
 let skyData;
 let rowTable;
-let eyeX = coursePoints[0][0] * TILE_SIZE * FIXED;
-let eyeZ = coursePoints[0][1] * TILE_SIZE * FIXED;
-let yaw = Math.atan2(coursePoints[1][0] - coursePoints[coursePoints.length - 1][0],
+let vehicleX = coursePoints[0][0] * TILE_SIZE * FIXED;
+let vehicleZ = coursePoints[0][1] * TILE_SIZE * FIXED;
+let vehicleYaw = Math.atan2(coursePoints[1][0] - coursePoints[coursePoints.length - 1][0],
   coursePoints[1][1] - coursePoints[coursePoints.length - 1][1]);
-let pitch = 0;
+let vehicleRoll = 0;
+let velocityX = Math.round(Math.sin(vehicleYaw) * 8 * FIXED);
+let velocityZ = Math.round(Math.cos(vehicleYaw) * 8 * FIXED);
 let speed = 8 * FIXED;
-let eyeHeight = 24 * FIXED;
+let yaw = vehicleYaw;
+let pitch = CHASE_PITCH;
+let eyeX = (vehicleX - Math.round(Math.sin(yaw) * CHASE_DISTANCE)) & WORLD_FIXED_MASK;
+let eyeZ = (vehicleZ - Math.round(Math.cos(yaw) * CHASE_DISTANCE)) & WORLD_FIXED_MASK;
+let eyeHeight = CHASE_HEIGHT;
 let canvasFocused = false;
 let renderMs = 0;
 
@@ -93,11 +128,11 @@ function setup() {
   const seedText = new URLSearchParams(globalThis.location?.search ?? '').get('seed');
   const seed = seedText === null || seedText === '' ? DEFAULT_COURSE_SEED : Number(seedText);
   regenerateCourse(Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff ? seed : DEFAULT_COURSE_SEED);
-  // 解像度の変更とカメラ位置のリセットを画面の操作に結び付けます。
+  // 解像度の変更と自機のリセットを画面の操作に結び付けます。
   document.getElementById('resolution')?.addEventListener('input', event => {
     setResolution(RESOLUTIONS[Number(event.target.value)]);
   });
-  document.getElementById('reset')?.addEventListener('click', resetCamera);
+  document.getElementById('reset')?.addEventListener('click', resetVehicle);
   // 指定番号での再生成と、新しい番号を選ぶランダム生成を受け付けます。
   const seedInput = document.getElementById('course-seed');
   document.getElementById('course-controls')?.addEventListener('submit', event => {
@@ -109,17 +144,21 @@ function setup() {
   });
 }
 
-function resetCamera() {
-  // 生成したコースの開始位置と進行方向にカメラを戻します。
+function resetVehicle() {
+  // 自機をコースの開始位置に戻し、初速を機首方向へ与えます。
   const first = coursePoints[0];
   const next = coursePoints[1];
   const previous = coursePoints[coursePoints.length - 1];
-  eyeX = first[0] * TILE_SIZE * FIXED;
-  eyeZ = first[1] * TILE_SIZE * FIXED;
-  yaw = Math.atan2(next[0] - previous[0], next[1] - previous[1]);
-  pitch = 0;
+  vehicleX = first[0] * TILE_SIZE * FIXED;
+  vehicleZ = first[1] * TILE_SIZE * FIXED;
+  vehicleYaw = Math.atan2(next[0] - previous[0], next[1] - previous[1]);
+  vehicleRoll = 0;
+  velocityX = Math.round(Math.sin(vehicleYaw) * 8 * FIXED);
+  velocityZ = Math.round(Math.cos(vehicleYaw) * 8 * FIXED);
   speed = 8 * FIXED;
-  eyeHeight = 24 * FIXED;
+  pitch = CHASE_PITCH;
+  eyeHeight = CHASE_HEIGHT;
+  updateCamera();
   rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
   renderMs = 0;
 }
@@ -133,7 +172,7 @@ function regenerateCourse(seed) {
   sceneryData = undefined;
   mapData = new Uint8Array(MAP_SIZE * MAP_SIZE);
   mapRows = 0;
-  resetCamera();
+  resetVehicle();
   const seedInput = document.getElementById('course-seed');
   if (seedInput) seedInput.value = String(seed);
   const status = document.getElementById('status');
@@ -205,38 +244,123 @@ function makeRowTable(screenHeight, horizon, angle = 0) {
   return { inverse, depthRatio, firstRow, sinPitch, cosPitch };
 }
 
-function updateCamera(dt, isDown) {
-  // 矢印キーで向きを変え、上下角が変化したときだけ投影表を更新します。
+function updateVehicle(dt, isDown) {
+  if (dt <= 0) return;
+  // 入力は自機に作用します。旋回だけで速度ベクトルを機首方向へ置き換えません。
+  const steering = ((isDown(39) ? 1 : 0) - (isDown(37) ? 1 : 0)) * STEERING_SPEED;
+  const braking = isDown(83);
+  const thrust = !braking && isDown(87) ? ENGINE_ACCELERATION : 0;
+  const shift = braking ? 0 : ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * WEIGHT_SHIFT_SPEED_RATIO;
+  // 重心移動の方向へ機体だけを20度傾け、キーを離したらすぐ水平に戻します。
+  vehicleRoll = Math.sign(shift) * VEHICLE_LEAN_ANGLE;
+  // フレーム間隔による差を小さくするため、最大1/120秒ごとに力と移動を積分します。
+  const steps = Math.ceil(dt / PHYSICS_STEP);
+  const step = dt / steps;
+  const rolling = (!braking && thrust === 0 ? COAST_DECELERATION : ROLLING_DECELERATION) * step / 2;
+  const lateralLoss = 1 - Math.exp(-LATERAL_RESISTANCE * step / 2);
+  for (let i = 0; i < steps; ++i) {
+    const oldVelocityX = velocityX;
+    const oldVelocityZ = velocityZ;
+    const middleYaw = vehicleYaw + steering * step / 2;
+    const sin = Math.sin(middleYaw);
+    const cos = Math.cos(middleYaw);
+    vehicleYaw += steering * step;
+    // 機首に対する横速度だけを減衰させます。慣性を残しながら横滑りを抑えます。
+    let slip = (velocityX * cos - velocityZ * sin) * lateralLoss;
+    velocityX -= cos * slip;
+    velocityZ += sin * slip;
+    // 低速でも減速する走行抵抗と高速ほど大きい二乗抵抗を、推力の前後に半分ずつ適用します。
+    let magnitude = Math.hypot(velocityX, velocityZ);
+    let drag = magnitude > 0
+      ? Math.max(0, 1 - rolling / magnitude) / (1 + DRAG_COEFFICIENT * (magnitude / FIXED) * step / 2) : 0;
+    velocityX *= drag;
+    velocityZ *= drag;
+    if (braking) {
+      // ブレーキは移動方向と反対に働き、停止を越えて後退させません。
+      magnitude *= drag;
+      const remaining = magnitude > 0 ? Math.max(0, 1 - BRAKE_DECELERATION * step / magnitude) : 0;
+      velocityX *= remaining;
+      velocityZ *= remaining;
+    } else if (thrust !== 0) {
+      velocityX += sin * thrust * step;
+      velocityZ += cos * thrust * step;
+    }
+    magnitude = Math.hypot(velocityX, velocityZ);
+    drag = magnitude > 0
+      ? Math.max(0, 1 - rolling / magnitude) / (1 + DRAG_COEFFICIENT * (magnitude / FIXED) * step / 2) : 0;
+    velocityX *= drag;
+    velocityZ *= drag;
+    slip = (velocityX * cos - velocityZ * sin) * lateralLoss;
+    velocityX -= cos * slip;
+    velocityZ += sin * slip;
+    velocityX = Math.round(velocityX);
+    velocityZ = Math.round(velocityZ);
+    // ごく小さい残速だけ0にし、位置と速度は16.16固定小数点で保持します。
+    if (Math.hypot(velocityX, velocityZ) < FIXED / 256) velocityX = velocityZ = 0;
+    const travelX = (oldVelocityX + velocityX) * step / 2;
+    const travelZ = (oldVelocityZ + velocityZ) * step / 2;
+    // 重心移動は位置にだけ加え、慣性の速度には蓄積しません。離すとこの横移動だけ即座に消えます。
+    const side = Math.hypot(travelX, travelZ) * shift;
+    vehicleX = (vehicleX + Math.round(travelX + cos * side)) & WORLD_FIXED_MASK;
+    vehicleZ = (vehicleZ + Math.round(travelZ - sin * side)) & WORLD_FIXED_MASK;
+  }
+  speed = Math.round(Math.hypot(velocityX, velocityZ));
+}
+
+function updateCamera(dt = 0, isDown = vehicleKeyIsDown) {
+  // 上下キーで視点の角度、Page Up/Downで高度を変えます。投影表は角度変更時だけ更新します。
   const oldPitch = pitch;
-  yaw += ((isDown(39) ? 1 : 0) - (isDown(37) ? 1 : 0)) * 1.5 * dt;
   pitch += ((isDown(40) ? 1 : 0) - (isDown(38) ? 1 : 0)) * 0.5 * dt;
   pitch = Math.max(-Math.PI / 2, Math.min(Math.PI * 0.39, pitch));
+  eyeHeight = Math.max(FIXED, eyeHeight
+    + ((isDown(33) ? 1 : 0) - (isDown(34) ? 1 : 0)) * Math.round(50 * dt * FIXED));
   if (pitch !== oldPitch) rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
-  // Wで加速し、Sで速度を0まで下げます。
-  const acceleration = Math.round(50 * dt * FIXED);
-  const braking = Math.round(75 * dt * FIXED);
-  if (isDown(83)) speed = Math.max(0, speed - braking);
-  else if (isDown(87)) speed = Math.min(400 * FIXED, Math.max(0, speed) + acceleration);
-  else speed = Math.max(0, speed);
-  // 前進とA/Dの横移動を向きに応じて地上座標に変換します。
-  // 上下角による速度補正を戻す場合は、次の式を使用します。
-  // const forward = Math.round(speed * rowTable.cosPitch * dt);
-  const forward = Math.round(speed * dt);
-  const side = ((isDown(68) ? 1 : 0) - (isDown(65) ? 1 : 0)) * Math.round(50 * dt * FIXED);
+  // カメラは速度の向きではなく機首の向きに追従し、常に自機の真後ろに置きます。
+  yaw = vehicleYaw;
   const sinYaw = Math.sin(yaw);
   const cosYaw = Math.cos(yaw);
-  eyeX = (eyeX + Math.round(sinYaw * forward) + Math.round(cosYaw * side)) & WORLD_FIXED_MASK;
-  eyeZ = (eyeZ + Math.round(cosYaw * forward) - Math.round(sinYaw * side)) & WORLD_FIXED_MASK;
-  // Page Up/Downで高度を変更し、下限に達したら上下角を水平に戻します。
-  eyeHeight += ((isDown(33) ? 1 : 0) - (isDown(34) ? 1 : 0)) * Math.round(50 * dt * FIXED);
-  if (eyeHeight <= FIXED) {
-    eyeHeight = FIXED;
-    if (pitch !== 0) {
-      pitch = 0;
-      rowTable = makeRowTable(VIEW_H, HORIZON, pitch);
-    }
-  }
+  eyeX = (vehicleX - Math.round(sinYaw * CHASE_DISTANCE)) & WORLD_FIXED_MASK;
+  eyeZ = (vehicleZ - Math.round(cosYaw * CHASE_DISTANCE)) & WORLD_FIXED_MASK;
   return { sinYaw, cosYaw };
+}
+
+function drawVehicle() {
+  // 影と機体を地面と同じカメラ座標へ投影し、解像度を変えても位置と比率を保ちます。
+  push();
+  noStroke();
+  const sinRoll = Math.sin(vehicleRoll);
+  const cosRoll = Math.cos(vehicleRoll);
+  for (const part of VEHICLE_PARTS) {
+    const points = part.points.map(([x, z]) => {
+      // 高さ1.5の機体中心を軸に左右へ傾けます。高さ0の影は地面に残します。
+      const bodyX = part.height === 0 ? x : x * cosRoll + (part.height - 1.5) * sinRoll;
+      const bodyHeight = part.height === 0 ? 0 : 1.5 + (part.height - 1.5) * cosRoll - x * sinRoll;
+      const height = eyeHeight / FIXED - bodyHeight;
+      const depth = CHASE_DISTANCE / FIXED + z;
+      return [bodyX, height * rowTable.cosPitch + depth * rowTable.sinPitch,
+        depth * rowTable.cosPitch - height * rowTable.sinPitch];
+    });
+    // 視点を上へ向けて機体がカメラの後ろへ入る場合は、手前の面で切ってから投影します。
+    const clipped = [];
+    let previous = points[points.length - 1];
+    for (const point of points) {
+      if ((previous[2] >= 0.1) !== (point[2] >= 0.1)) {
+        const t = (0.1 - previous[2]) / (point[2] - previous[2]);
+        clipped.push([previous[0] + (point[0] - previous[0]) * t,
+          previous[1] + (point[1] - previous[1]) * t, 0.1]);
+      }
+      if (point[2] >= 0.1) clipped.push(point);
+      previous = point;
+    }
+    if (clipped.length < 3) continue;
+    fill(...part.color);
+    beginShape();
+    for (const [x, y, depth] of clipped) {
+      vertex(VIEW_W / 2 + FOCAL * x / depth, HORIZON + FOCAL * y / depth);
+    }
+    endShape(CLOSE);
+  }
+  pop();
 }
 
 function draw() {
@@ -266,10 +390,9 @@ function draw() {
       paletteBytes[index + 2] = Math.round(GLASS_COLORS[shade][2] + (GLASS_LIGHT_COLORS[shade][2] - GLASS_COLORS[shade][2]) * glassBlend);
     }
   }
-  // マップの準備完了後にカメラを更新し、描画用の向きを取得します。
-  const { sinYaw, cosYaw } = mapRows === MAP_SIZE
-    ? updateCamera(dt, cameraKeyIsDown)
-    : { sinYaw: Math.sin(yaw), cosYaw: Math.cos(yaw) };
+  // マップ完成後に自機を動かし、その位置と機首方向から追従カメラを配置します。
+  if (mapRows === MAP_SIZE) updateVehicle(dt, vehicleKeyIsDown);
+  const { sinYaw, cosYaw } = updateCamera(mapRows === MAP_SIZE ? dt : 0, vehicleKeyIsDown);
 
   // 先に空を描き、マップは1フレームにつき最大8行ずつ生成します。
   const startTime = performance.now();
@@ -288,14 +411,15 @@ function draw() {
   const output32 = new Uint32Array(pixels.buffer, pixels.byteOffset, pixels.byteLength / 4);
   renderGround(output32, mapData, tileData, palette32, eyeX, eyeZ, sinYaw, cosYaw, eyeHeight, rowTable);
   updatePixels();
+  drawVehicle();
   renderMs += (performance.now() - startTime - renderMs) * 0.1;
   if ((frameCount & 0xf) === 0) {
     const status = document.getElementById('status');
-    if (status) status.textContent = `速度 ${(speed / FIXED).toFixed(0)} / 高度 ${(eyeHeight / FIXED).toFixed(0)} / ${frameRate().toFixed(0)} fps / 描画 ${renderMs.toFixed(2)} ms`;
+    if (status) status.textContent = `速度 ${(speed / FIXED).toFixed(0)} / 視点高 ${(eyeHeight / FIXED).toFixed(0)} / ${frameRate().toFixed(0)} fps / 描画 ${renderMs.toFixed(2)} ms`;
   }
 }
 
-function cameraKeyIsDown(code) {
+function vehicleKeyIsDown(code) {
   // キャンバスにフォーカスがある場合だけキー入力を有効にします。
   return canvasFocused && keyIsDown(code);
 }
