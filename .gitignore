@@ -4,6 +4,8 @@
 !.gitignore
 !/AGENTS.md
 !/CONTEXT.md
+!/README.md
 !/index.html
 !/sketch.js
 !/verify.cjs
+!/screenshots/gameplay.png
