@@ -51,27 +51,30 @@ const COORD_MAP_BITS = 9;
 const COORD_FIXED_SHIFT = 16 - COORD_FRACTION_BITS;
 const COORD_MASK = 0xffff;
 const COORD_MAP_MASK = (1 << COORD_MAP_BITS) - 1;
-// 水面と赤系の循環範囲・更新間隔、路面用のタイル種類を定義します。
-const WATER_PALETTE_START = 32 + 25 * 8;
-const WATER_PALETTE_LENGTH = 8;
-const WATER_FRAME_MS = 60;
-const RED_PALETTE_START = 32 + 12 * 8;
-const RED_PALETTE_LENGTH = 8;
-const PALETTE_CYCLES = [
-  [WATER_PALETTE_START, WATER_PALETTE_LENGTH],
-  [RED_PALETTE_START, RED_PALETTE_LENGTH]
-];
-// 球専用の8色は、反射光の白を含めずに深い青と明るい水色の間で変化させます。
-const GLASS_PALETTE_START = 32 + 26 * 8;
-const GLASS_PULSE_MS = WATER_FRAME_MS * 24;
-const GLASS_COLORS = [
-  [8, 30, 94], [10, 43, 119], [13, 58, 145], [18, 77, 169],
-  [27, 98, 192], [40, 121, 213], [60, 146, 231], [88, 173, 245]
-];
-const GLASS_LIGHT_COLORS = [
-  [10, 91, 137], [15, 116, 166], [22, 143, 193], [33, 170, 217],
-  [48, 195, 235], [69, 216, 247], [104, 233, 253], [151, 246, 255]
-];
+// 固定216色は青→緑→赤の順で変化し、残る40色を5組のアニメーションに使います。
+const FIXED_PALETTE_LENGTH = 216;
+const PALETTE_GRADIENT_LENGTH = 8;
+const PALETTE_FRAME_MS = 60;
+const GLASS_PULSE_MS = PALETTE_FRAME_MS * 24;
+// 承認済みの画像と同じ初期色です。40色だけはRGB各成分を6段階に制限しません。
+const PALETTE_GRADIENTS = [
+  { key: 'glassPulse', name: 'ガラス球・明暗変化', start: FIXED_PALETTE_LENGTH, dark: [8, 24, 96], light: [144, 232, 255] },
+  { key: 'purpleWave', name: '紫・地上タイル', start: 224, dark: [32, 0, 32], light: [255, 0, 255] },
+  { key: 'water', name: '青・海と水', start: 232, dark: [8, 24, 80], light: [64, 144, 248] },
+  { key: 'desert', name: '砂漠', start: 240, dark: [112, 72, 32], light: [255, 232, 168] },
+  { key: 'grass', name: '緑・草原', start: 248, dark: [8, 40, 16], light: [96, 224, 112] }
+].map(ramp => ({ ...ramp, colors: Array.from({length: PALETTE_GRADIENT_LENGTH}, (_, shade) =>
+  ramp.dark.map((value, channel) => Math.round(value + (ramp.light[channel] - value) * shade / 7))) }));
+const PALETTE_STARTS = Object.fromEntries(PALETTE_GRADIENTS.map(ramp => [ramp.key, ramp.start]));
+const GLASS_COLORS = PALETTE_GRADIENTS[0].colors;
+const GLASS_LIGHT_COLORS = GLASS_COLORS.map(color => color.map(v => Math.round(v + (255 - v) * 0.35)));
+const GLASS_PALETTE_START = PALETTE_STARTS.glassPulse;
+const PURPLE_PALETTE_START = PALETTE_STARTS.purpleWave;
+const WATER_PALETTE_START = PALETTE_STARTS.water;
+const DESERT_PALETTE_START = PALETTE_STARTS.desert;
+const GRASS_PALETTE_START = PALETTE_STARTS.grass;
+const PALETTE_CYCLES = [PURPLE_PALETTE_START, WATER_PALETTE_START, DESERT_PALETTE_START, GRASS_PALETTE_START]
+  .map(start => [start, PALETTE_GRADIENT_LENGTH]);
 const ASPHALT_FAMILIES = [11, 12, 26, 27];
 
 // 地上データ、アニメーションの状態、自機と追従カメラの状態を保持します。
@@ -209,19 +212,18 @@ function setResolution(width) {
 }
 
 function makeSky() {
-  // RGBAバイト列と32bit配列で同じ領域を参照し、空を行単位で塗ります。
+  // 空色の画像は解像度変更時にだけ作り、地上用パレットの変化から独立させます。
   const data = new Uint8ClampedArray(VIEW_W * VIEW_H * 4);
   const sky32 = new Uint32Array(data.buffer);
-  const skyColor = new Uint8ClampedArray(4);
-  const skyColor32 = new Uint32Array(skyColor.buffer);
-  skyColor[3] = 255;
-  // 地平線に向かって明るくなるグラデーションを作ります。
+  const color = new Uint8ClampedArray(4);
+  const color32 = new Uint32Array(color.buffer);
+  color[3] = 255;
   for (let y = 0; y < VIEW_H; ++y) {
     const t = Math.min(y / HORIZON, 1);
-    skyColor[0] = 65 + 85 * t;
-    skyColor[1] = 115 + 75 * t;
-    skyColor[2] = 175 + 45 * t;
-    sky32.fill(skyColor32[0], y * VIEW_W, (y + 1) * VIEW_W);
+    color[0] = 65 + 85 * t;
+    color[1] = 115 + 75 * t;
+    color[2] = 175 + 45 * t;
+    sky32.fill(color32[0], y * VIEW_W, (y + 1) * VIEW_W);
   }
   return data;
 }
@@ -364,12 +366,12 @@ function drawVehicle() {
 }
 
 function draw() {
-  // 経過時間に応じて水面用と赤系のパレットを、それぞれ8色の中で循環させます。
+  // 紫の地上タイル・水面・砂漠・草原を、それぞれの8色内で循環させます。
   const dt = Math.min(deltaTime, 50) / 1000;
   paletteAnimationMs += deltaTime;
-  if (paletteAnimationMs >= WATER_FRAME_MS) {
-    const steps = Math.floor(paletteAnimationMs / WATER_FRAME_MS);
-    paletteAnimationMs -= steps * WATER_FRAME_MS;
+  if (paletteAnimationMs >= PALETTE_FRAME_MS) {
+    const steps = Math.floor(paletteAnimationMs / PALETTE_FRAME_MS);
+    paletteAnimationMs -= steps * PALETTE_FRAME_MS;
     // 最後の色を退避し、[0]→[1]→…→[7]→[0]の順に1段ずつ移します。
     for (const [start, length] of PALETTE_CYCLES) {
       for (let step = 0; step < steps % length; ++step) {
@@ -380,8 +382,8 @@ function draw() {
         palette32[start] = lastColor;
       }
     }
-    // 深い青から明るい水色へ、同じ60ms刻みで補間します。反射光や路面は固定です。
-    glassPulseMs = (glassPulseMs + steps * WATER_FRAME_MS) % GLASS_PULSE_MS;
+    // ガラス球の216～223番だけを同じ60ms刻みで明暗変化させます。
+    glassPulseMs = (glassPulseMs + steps * PALETTE_FRAME_MS) % GLASS_PULSE_MS;
     const glassBlend = 0.5 - 0.5 * Math.cos(glassPulseMs * Math.PI * 2 / GLASS_PULSE_MS);
     for (let shade = 0; shade < GLASS_COLORS.length; ++shade) {
       const index = (GLASS_PALETTE_START + shade) * 4;
@@ -397,6 +399,7 @@ function draw() {
   // 先に空を描き、マップは1フレームにつき最大8行ずつ生成します。
   const startTime = performance.now();
   loadPixels();
+  const output32 = new Uint32Array(pixels.buffer, pixels.byteOffset, pixels.byteLength / 4);
   pixels.set(skyData);
   if (mapRows < MAP_SIZE) {
     const endRow = Math.min(mapRows + 8, MAP_SIZE);
@@ -408,7 +411,6 @@ function draw() {
     return;
   }
   // 完成した地上を32bit画素として描画し、処理時間と状態を表示します。
-  const output32 = new Uint32Array(pixels.buffer, pixels.byteOffset, pixels.byteLength / 4);
   renderGround(output32, mapData, tileData, palette32, eyeX, eyeZ, sinYaw, cosYaw, eyeHeight, rowTable);
   updatePixels();
   drawVehicle();
@@ -456,178 +458,176 @@ function renderGround(output, map, tiles, palette, cameraX, cameraZ, sinYaw, cos
 }
 
 function makePalette() {
-  // 基本色と、それらを結ぶ8階調の組み合わせを定義します。
-  const colors = [
-    [65, 115, 175],
-    [0, 0, 0], [60, 60, 60], [120, 120, 120], [210, 210, 210], [255, 255, 255],
-    [96, 0, 24], [237, 28, 36], [255, 127, 39], [246, 170, 9], [249, 221, 59],
-    [255, 250, 188], [14, 185, 104], [19, 230, 123], [135, 255, 94], [12, 129, 110],
-    [16, 174, 166], [19, 225, 190], [96, 247, 242], [40, 80, 158], [64, 147, 228],
-    [107, 80, 246], [153, 177, 251], [120, 12, 153], [170, 56, 185], [224, 159, 249],
-    [203, 0, 122], [236, 31, 128], [243, 141, 169], [104, 70, 52], [149, 104, 42], [248, 178, 119]
-  ];
-  const ramps = [
-    [12, 13], [13, 14], [29, 30], [30, 31], [9, 10], [12, 14], [29, 30], [3, 4],
-    [3, 4], [19, 20], [20, 18], [18, 5], [6, 7], [19, 20], [30, 31], [12, 13],
-    [12, 14], [2, 29], [29, 12], [7, 8], [20, 21], [15, 16], [23, 24], [26, 27],
-    [1, 2], [19, 20], [19, 20], [19, 20]
-  ];
+  // RGB各6段階の固定216色と、アニメーション用40色を書き込みます。
   // RGBAの書き込みと32bit色の読み出しで、同じバッファを共有します。
   const bytes = new Uint8ClampedArray(256 * 4);
   const palette = new Uint32Array(bytes.buffer);
-  for (let color = 0; color < colors.length; ++color) {
-    const index = color * 4;
-    bytes[index] = colors[color][0];
-    bytes[index + 1] = colors[color][1];
-    bytes[index + 2] = colors[color][2];
-    bytes[index + 3] = 255;
-  }
-  // 基本色の間を補間し、パレット32番以降に8階調ずつ設定します。
-  for (let ramp = 0; ramp < ramps.length; ++ramp) {
-    const from = colors[ramps[ramp][0]];
-    const to = colors[ramps[ramp][1]];
-    for (let shade = 0; shade < 8; ++shade) {
-      const index = (32 + ramp * 8 + shade) * 4;
-      const amount = shade / 7;
-      bytes[index] = Math.round(from[0] + (to[0] - from[0]) * amount);
-      bytes[index + 1] = Math.round(from[1] + (to[1] - from[1]) * amount);
-      bytes[index + 2] = Math.round(from[2] + (to[2] - from[2]) * amount);
-      bytes[index + 3] = 255;
+  for (let index = 3; index < bytes.length; index += 4) bytes[index] = 255;
+  for (let red = 0; red < 6; ++red) {
+    for (let green = 0; green < 6; ++green) {
+      for (let blue = 0; blue < 6; ++blue) {
+        const index = (red * 36 + green * 6 + blue) * 4;
+        bytes[index] = red * 51;
+        bytes[index + 1] = green * 51;
+        bytes[index + 2] = blue * 51;
+      }
     }
   }
-  // 空いている8パレットをガラス球専用に割り当てます。
-  for (let shade = 0; shade < GLASS_COLORS.length; ++shade) {
-    const index = (GLASS_PALETTE_START + shade) * 4;
-    bytes[index] = GLASS_COLORS[shade][0];
-    bytes[index + 1] = GLASS_COLORS[shade][1];
-    bytes[index + 2] = GLASS_COLORS[shade][2];
-    bytes[index + 3] = 255;
+  for (const ramp of PALETTE_GRADIENTS) {
+    for (let shade = 0; shade < PALETTE_GRADIENT_LENGTH; ++shade) {
+      const index = (PALETTE_STARTS[ramp.key] + shade) * 4;
+      for (let channel = 0; channel < 3; ++channel) {
+        bytes[index + channel] = ramp.colors[shade][channel];
+      }
+    }
   }
   return palette;
 }
 
 function makeTiles() {
-  // 32種類のタイル群それぞれについて、8種類の模様を生成します。
-  const ramps = [
-    0, 1, 2, 3, 25, 25, 4, 5, 6, 2, 3, 7, 7, 24, 8, 0,
-    18, 15, 16, 1, 12, 13, 14, 19, 8, 26, 7, 7, 21, 22, 23, 17
+  // 各素材の暗色と明色を、R・G・Bそれぞれ0～5の値で指定します。
+  // 画素ごとの色番号や、旧8階調から色番号への変換表は保持しません。
+  const colorBounds = [
+    [0, 1, 1, 3, 4, 4], // 0: 濃い緑
+    [1, 1, 0, 4, 5, 3], // 1: 黄緑
+    [1, 0, 0, 4, 3, 3], // 2: 焦茶色
+    [1, 1, 1, 5, 4, 4], // 3: ベージュ
+    [0, 0, 1, 3, 3, 4], // 4: 紺
+    [0, 0, 1, 3, 3, 4], // 5: 紺
+    [1, 1, 0, 5, 4, 3], // 6: 金
+    [0, 1, 1, 3, 5, 4], // 7: 緑
+    [1, 0, 0, 4, 3, 3], // 8: 焦茶色
+    [1, 0, 0, 4, 3, 3], // 9: 焦茶色
+    [1, 1, 1, 5, 4, 4], // 10: ベージュ
+    [2, 2, 2, 4, 4, 4], // 11: 灰色
+    [2, 2, 2, 4, 4, 4], // 12: 灰色
+    [0, 0, 0, 2, 2, 2], // 13: 濃い灰色
+    [2, 2, 2, 4, 4, 4], // 14: 灰色
+    [0, 1, 1, 3, 4, 4], // 15: 濃い緑
+    [0, 1, 1, 3, 4, 4], // 16: 濃い青緑
+    [0, 1, 1, 3, 4, 4], // 17: 濃い緑
+    [0, 1, 1, 3, 5, 4], // 18: 緑
+    [1, 1, 0, 4, 5, 3], // 19: 黄緑
+    [0, 0, 0, 3, 1, 1], // 20: 深紅
+    [0, 1, 1, 3, 4, 5], // 21: 青
+    [1, 1, 0, 4, 4, 3], // 22: 茶色
+    [1, 1, 0, 5, 4, 3], // 23: 橙
+    [2, 2, 2, 4, 4, 4], // 24: 灰色
+    [0, 1, 1, 3, 4, 5], // 25: 青
+    [2, 2, 2, 4, 4, 4], // 26: 灰色
+    [2, 2, 2, 4, 4, 4], // 27: 灰色
+    [0, 1, 1, 3, 4, 4], // 28: 青緑
+    [1, 0, 1, 4, 3, 4], // 29: 紫
+    [1, 0, 1, 5, 3, 4], // 30: 桃色
+    [1, 0, 0, 4, 3, 3], // 31: 焦茶色
   ];
   const tiles = new Uint8Array(256 * TILE_SIZE * TILE_SIZE);
-  for (let family = 0; family < ramps.length; ++family) {
+  for (let family = 0; family < 32; ++family) {
+    const [darkR, darkG, darkB, lightR, lightG, lightB] = colorBounds[family];
+    const asphalt = ASPHALT_FAMILIES.includes(family);
     for (let variant = 0; variant < 8; ++variant) {
-      const tileNumber = family * 8 + variant;
+      const offset = (family * 8 + variant) << 8;
       for (let y = 0; y < TILE_SIZE; ++y) {
         for (let x = 0; x < TILE_SIZE; ++x) {
-          const noise = (x * 17 ^ y * 31 ^ variant * 13 ^ family * 7) & 7;
-          const direction = variant & 1 ? x : y;
-          let shade = noise;
-          let ramp = ramps[family];
-          const isAsphalt = family === 11 || family === 12 || family === 26 || family === 27;
-          // 草地には小さな領域ごとに向きの異なる芝目を描きます。
-          if (family === 0) {
-            const cellX = x >> 2;
-            const cellY = y >> 2;
-            let grassHash = Math.imul(cellX + variant * 17 + 1, 0x45d9f3b)
-              ^ Math.imul(cellY + 1, 0x27d4eb2d);
-            grassHash ^= grassHash >>> 16;
-            const localX = x & 3;
-            const localY = y & 3;
-            const orientation = (grassHash >>> 2) & 3;
-            const start = (grassHash >>> 4) & 1;
-            const length = 2 + ((grassHash >>> 5) & 1);
-            let blade = false;
-            if ((grassHash & 3) !== 0) {
-              if (orientation === 0) {
-                blade = localX === ((grassHash >>> 6) & 3) && localY >= start && localY < start + length;
-              } else if (orientation === 1) {
-                blade = localY === ((grassHash >>> 6) & 3) && localX >= start && localX < start + length;
-              } else if (orientation === 2) {
-                blade = localX === ((localY + ((grassHash >>> 6) & 1)) & 3);
-              } else {
-                blade = localX === ((3 - localY + ((grassHash >>> 6) & 1)) & 3);
-              }
-            }
-            shade = 3 + (noise & 1);
-            if (blade) shade = 5 + ((grassHash >>> 8) & 1);
-          }
-          // 水面、畑、境界などはタイル群ごとの模様を付けます。
-          if (family === 1 || family === 3 || family === 10 || family === 24 || family === 25) {
-            shade = (noise + 2) & 7;
-          }
-          // 水面は共通の8色を並べ、タイル境界でも波の位相をつなげます。
-          if (family === 4 || family === 5) {
-            const waveOffset = Math.min(x, TILE_SIZE - x) >> 2;
-            shade = (y + waveOffset) & (WATER_PALETTE_LENGTH - 1);
-          }
-          if (family >= 6 && family <= 9) shade = (direction & 7) < 2 ? 1 : 3 + (noise & 3);
-          if (family === 10 && ((x + variant) & 15) < 2) shade = 7;
-          // アスファルトは座標ごとのハッシュから3階調の粒を選びます。
-          if (isAsphalt) {
+          const noise = x * 17 ^ y * 31 ^ variant * 13 ^ family * 7;
+          let level = noise % 6;
+          let red = -1, green = 0, blue = 0;
+          let paletteIndex = -1;
+          // 路面は灰色を半分、1段暗い色と明るい色を残り半分に散らします。
+          if (asphalt) {
             let hash = Math.imul(x + variant * 17 + 1, 0x45d9f3b)
               ^ Math.imul(y + family * 13 + 1, 0x27d4eb2d);
             hash ^= hash >>> 16;
             hash = Math.imul(hash, 0x45d9f3b);
             hash ^= hash >>> 16;
-            shade = 2 + ((hash >>> ((family & 3) * 3)) % 3);
-          }
-          // 縁石、樹木、建物などの色と模様をタイル群ごとに決めます。
-          if (family === 13) shade = 5 + (noise & 2);
-          if (family === 14) shade = ((y + variant * 2) & 7) < 4 ? 7 : 1;
-          if (family === 16) shade = noise < 4 ? 1 : 3;
-          if (family === 17 || family === 18) {
-            const dx = x - (7 + (variant & 1));
-            const dy = y - (7 + ((variant >> 1) & 1));
-            shade = dx * dx + dy * dy < 50 + (variant & 3) * 5 ? (noise < 4 ? 5 : 7) : 1;
-          }
-          if (family >= 20 && family <= 23) shade = (x + y + variant) & 7;
-          if (family === 23 && x > 7) shade = Math.max(0, shade - 3);
-          if (family === 24 && (x < 2 || y < 2)) shade = 7;
-          // 半径8の球を16×16ドットの端まで描き、白い反射光を中央寄りに置きます。
-          if (family === 25) {
-            const dx = x - 7.5;
-            const dy = y - 7.5;
-            const distanceSquared = dx * dx + dy * dy;
-            if (distanceSquared > 64) continue;
-            // 外周の枠は基本色の青20番・紺19番を使い、球本体と一緒に明暗させません。
-            if (distanceSquared >= 49) {
-              tiles[(tileNumber << 8) | (y << 4) | x] = dy < 0 ? 20 : 19;
-              continue;
+            const grain = (hash >>> ((family & 3) * 3)) & 7;
+            red = green = blue = grain >= 4 ? 3 : (grain & 1) ? 4 : 2;
+          } else if (family === 0) {
+            // 芝の背景だけを循環色にし、細い葉は固定216色で描きます。
+            const cellX = x >> 2, cellY = y >> 2;
+            let hash = Math.imul(cellX + variant * 17 + 1, 0x45d9f3b)
+              ^ Math.imul(cellY + 1, 0x27d4eb2d);
+            hash ^= hash >>> 16;
+            const localX = x & 3, localY = y & 3;
+            const orientation = (hash >>> 2) & 3;
+            const start = (hash >>> 4) & 1;
+            const length = 2 + ((hash >>> 5) & 1);
+            let blade = false;
+            if ((hash & 3) !== 0) {
+              if (orientation === 0) blade = localX === ((hash >>> 6) & 3) && localY >= start && localY < start + length;
+              else if (orientation === 1) blade = localY === ((hash >>> 6) & 3) && localX >= start && localX < start + length;
+              else if (orientation === 2) blade = localX === ((localY + ((hash >>> 6) & 1)) & 3);
+              else blade = localX === ((3 - localY + ((hash >>> 6) & 1)) & 3);
             }
-            const distance = Math.sqrt(distanceSquared);
-            shade = Math.max(0, Math.min(7, Math.round(8 - distance - (dx + dy) * 0.16)));
-            const highlightX = 5 + (variant & 1);
-            const highlightY = 5 + ((variant >> 1) & 1);
-            if (x === highlightX && y === highlightY) {
-              ramp = 11;
-              shade = 7;
+            if (blade) {
+              red = 1 + ((hash >>> 8) & 1); green = 4; blue = 3;
+            } else paletteIndex = GRASS_PALETTE_START + ((x + (y >> 1)) & 7);
+          } else if (family === 3) {
+            paletteIndex = DESERT_PALETTE_START + ((x + (Math.min(y, TILE_SIZE - y) >> 2)) & 7);
+          } else if (family === 4 || family === 5) {
+            paletteIndex = WATER_PALETTE_START + ((y + (Math.min(x, TILE_SIZE - x) >> 2)) & 7);
+          } else if (family >= 6 && family <= 9) {
+            const direction = (variant & 1) ? x : y;
+            level = (direction & 7) < 2 ? 1 : 2 + (noise & 3);
+          } else if (family === 13) {
+            red = green = blue = 2;
+          } else if (family === 14) {
+            red = green = blue = ((y + variant * 2) & 7) < 4 ? 4 : 2;
+          } else if (family === 16) {
+            red = 0; green = blue = (noise & 7) < 4 ? 1 : 2;
+          } else if (family === 17 || family === 18) {
+            const dx = x - (7 + (variant & 1)), dy = y - (7 + ((variant >> 1) & 1));
+            if (dx * dx + dy * dy < 50 + (variant & 3) * 5) {
+              red = (noise & 7) < 4 ? 1 : 3;
+              green = family === 17 ? 4 : 5;
+              blue = (noise & 7) < 4 ? 3 : 4;
+            } else { red = 0; green = 2; blue = 1; }
+          } else if (family >= 20 && family <= 23) {
+            level = (x + y + variant) % 6;
+            if (family === 23 && x > 7) level = Math.max(0, level - 3);
+          } else if (family === 25) {
+            // 球の内側だけを明暗用8色にし、円形の枠と1ドットの反射光は固定色です。
+            const dx = x - 7.5, dy = y - 7.5;
+            const distance2 = dx * dx + dy * dy;
+            if (distance2 > 64) continue;
+            if (distance2 >= 49) {
+              red = 1; green = dy < 0 ? 3 : 1; blue = dy < 0 ? 4 : 2;
+            } else {
+              const phase = Math.max(0, Math.min(7, Math.round(8 - Math.sqrt(distance2) - (dx + dy) * 0.16)));
+              paletteIndex = GLASS_PALETTE_START + phase;
+              if (x === 5 + (variant & 1) && y === 5 + ((variant >> 1) & 1)) {
+                red = green = blue = 5; paletteIndex = -1;
+              }
             }
+          } else if (family === 29) {
+            paletteIndex = PURPLE_PALETTE_START + ((x + (y >> 1)) & 7);
+          } else {
+            if (family === 1 || family === 10 || family === 24) level = (noise + 2) % 6;
+            if (family === 10 && ((x + variant) & 15) < 2) level = 5;
+            if (family === 24 && (x < 2 || y < 2)) level = 5;
           }
-          const tileIndex = (tileNumber << 8) | (y << 4) | x;
-          let paletteIndex = 32 + ramp * 8 + shade;
-          // アスファルトの2×2画素が同じ色になった場合は最後の画素を変えます。
-          if (isAsphalt && x > 0 && y > 0) {
-            const left = tiles[tileIndex - 1];
-            const above = tiles[tileIndex - TILE_SIZE];
-            const aboveLeft = tiles[tileIndex - TILE_SIZE - 1];
-            if (left === above && above === aboveLeft && paletteIndex === left) {
-              shade = shade === 4 ? 3 : 4;
-              paletteIndex = 32 + ramp * 8 + shade;
+          if (paletteIndex < 0) {
+            // RGB各成分を6段階の整数で求め、その場で最終的なパレット番号にします。
+            if (red < 0) {
+              red = ((darkR * (5 - level) + lightR * level + 2) / 5) | 0;
+              green = ((darkG * (5 - level) + lightG * level + 2) / 5) | 0;
+              blue = ((darkB * (5 - level) + lightB * level + 2) / 5) | 0;
             }
+            paletteIndex = red * 36 + green * 6 + blue;
           }
-          tiles[tileIndex] = paletteIndex;
+          tiles[offset + y * TILE_SIZE + x] = paletteIndex;
         }
       }
     }
   }
-  // 全種類の生成後に路面をコピーし、球の外側も同じ3階調の粒状模様にします。
+  // 球の周囲は、路面と同じ生成済みアスファルトを使ってつなぎます。
   for (let variant = 0; variant < 8; ++variant) {
     const glassOffset = (25 * 8 + variant) << 8;
     const asphaltOffset = (ASPHALT_FAMILIES[variant & 3] * 8 + variant) << 8;
     for (let y = 0; y < TILE_SIZE; ++y) {
       for (let x = 0; x < TILE_SIZE; ++x) {
         if ((x - 7.5) ** 2 + (y - 7.5) ** 2 > 64) {
-          const pixel = (y << 4) | x;
-          tiles[glassOffset | pixel] = tiles[asphaltOffset | pixel];
+          tiles[glassOffset + y * TILE_SIZE + x] = tiles[asphaltOffset + y * TILE_SIZE + x];
         }
       }
     }

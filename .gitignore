@@ -1,7 +1,9 @@
-# Track only the project source files.
+# Track project source files and handoff guidance.
 *
 !*/
 !.gitignore
+!/AGENTS.md
+!/CONTEXT.md
 !/index.html
 !/sketch.js
 !/verify.cjs

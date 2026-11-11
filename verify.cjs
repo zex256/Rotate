@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 
 // p5.jsとDOMの境界だけを代用し、実際の自機・描画・生成処理を実行します。
 const events = {};
@@ -51,6 +52,56 @@ const near = (actual, expected, tolerance, message) =>
   assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: ${actual} vs ${expected}`);
 
 api.setup();
+// 承認済みの256色、RGB各6段階の並び、5組の8階調とタイルの参照先を検証します。
+const paletteAtSetup = run('palette32');
+const bytesAtSetup = Buffer.from(paletteAtSetup.buffer);
+assert.equal(crypto.createHash('sha256').update(bytesAtSetup).digest('hex'),
+  '1ee471caf8eb249a79a2ba3e119f657c05efad2143bfcb99e58970c04d459b11', 'all colors match the approved palette image');
+assert.equal(new Set(paletteAtSetup.subarray(0, 216)).size, 216);
+for (let red = 0; red < 6; ++red) for (let green = 0; green < 6; ++green) for (let blue = 0; blue < 6; ++blue) {
+  const index = (red * 36 + green * 6 + blue) * 4;
+  assert.deepEqual(Array.from(bytesAtSetup.subarray(index, index + 4)), [red * 51, green * 51, blue * 51, 255]);
+}
+const gradientsAtSetup = Array.from(run('PALETTE_GRADIENTS'));
+assert.deepEqual(gradientsAtSetup.map(r => [r.key, r.start]),
+  [['glassPulse', 216], ['purpleWave', 224], ['water', 232], ['desert', 240], ['grass', 248]]);
+for (const gradient of gradientsAtSetup) {
+  assert.equal(new Set(paletteAtSetup.subarray(gradient.start, gradient.start + 8)).size, 8);
+}
+assert.equal(run('GLASS_PALETTE_START'), 216);
+for (let i = 3; i < 1024; i += 4) assert.equal(bytesAtSetup[i], 255, 'no transparent colors');
+const initialTiles = run('tileData');
+assert.equal(initialTiles.length, 256 * 16 * 16);
+for (let i = 0; i < initialTiles.length; ++i) {
+  const color = initialTiles[i], family = i >>> 11;
+  if (color >= 216 && color < 224) assert.equal(family, 25, 'only glass bodies use the pulse palette');
+  if (color >= 224 && color < 232) assert.equal(family, 29, 'purple waves belong to purple ground tiles');
+  if (color >= 232 && color < 240) assert.ok(family === 4 || family === 5, 'only water uses the water palette');
+  if (color >= 240 && color < 248) assert.equal(family, 3, 'only sand uses the desert palette');
+  if (color >= 248) assert.equal(family, 0, 'only grass uses the grass palette');
+}
+for (let variant = 0; variant < 8; ++variant) {
+  const glassOffset = (25 * 8 + variant) << 8;
+  let highlights = 0;
+  for (let y = 0; y < 16; ++y) for (let x = 0; x < 16; ++x) {
+    const color = initialTiles[glassOffset + y * 16 + x];
+    if ((x - 7.5) ** 2 + (y - 7.5) ** 2 >= 49) assert.ok(color < 216, 'glass rims and background stay fixed');
+    if (color === 215) ++highlights;
+  }
+  assert.equal(highlights, 1, 'one fixed white highlight per glass tile');
+}
+for (const family of run('ASPHALT_FAMILIES')) for (let variant = 0; variant < 8; ++variant) {
+  const tile = initialTiles.subarray((family * 8 + variant) * 256, (family * 8 + variant + 1) * 256);
+  assert.deepEqual(Array.from(new Set(tile)).sort((a, b) => a - b), [86, 129, 172], 'neutral asphalt uses only the base and two noise colors');
+  const grainCount = Array.from(tile).filter(color => color !== 129).length;
+  assert.ok(grainCount >= 96 && grainCount <= 160, 'noise covers approximately half of each tile');
+}
+assert.equal(run('skyData.length'), 640 * 360 * 4);
+assert.deepEqual(Array.from(run('skyData.subarray(0, 4)')), [65, 115, 175, 255]);
+assert.deepEqual(Array.from(run('skyData.subarray(640 * 90 * 4, 640 * 90 * 4 + 4)')), [150, 190, 220, 255]);
+assert.deepEqual(Array.from(new Set(initialTiles.subarray(29 * 8 * 256, 30 * 8 * 256))).sort((a, b) => a - b),
+  [224, 225, 226, 227, 228, 229, 230, 231], 'purple ground tiles use every wave phase');
+console.log('PASS: approved RGB216 palette, five animation ranges, fixed glass highlights, half-coverage asphalt grains and blue sky');
 const initial = api.state();
 assert.equal(initial.speed / FIXED, 8);
 assert.equal(initial.eyeHeight / FIXED, 24);
@@ -293,15 +344,42 @@ assert.ok(api.state().speed < 8 * FIXED, 'drag remains active without focus');
 events['canvas:focus']();
 assert.equal(run('vehicleKeyIsDown(87)'), true);
 events['canvas:blur']();
-run('mapRows = MAP_SIZE; paletteAnimationMs = 0; glassPulseMs = 0; deltaTime = 60');
+run('mapRows = MAP_SIZE; palette32.set(makePalette()); paletteAnimationMs = 0; glassPulseMs = 0; deltaTime = 60');
 const paletteBefore = Array.from(run('palette32'));
 api.draw();
 const paletteAfter = Array.from(run('palette32'));
-for (const start of [128, 232]) {
+const cyclicStarts = Array.from(run('PALETTE_CYCLES'), pair => pair[0]);
+assert.deepEqual(cyclicStarts, [224, 232, 240, 248]);
+const outputAfterRotation = new Uint32Array(context.pixels.buffer);
+assert.equal(outputAfterRotation[0], run('new Uint32Array(skyData.buffer)[0]'), 'blue sky is independent of ground palette rotation');
+const blueRoofColors = new Set(run('tileData.subarray(21 * 8 * 256, 22 * 8 * 256)'));
+for (const color of blueRoofColors) {
+  assert.ok(!cyclicStarts.some(start => color >= start && color < start + 8), 'blue roofs use a fixed palette');
+}
+for (const start of cyclicStarts) {
   for (let i = 0; i < 8; ++i) assert.equal(paletteAfter[start + (i + 1) % 8], paletteBefore[start + i]);
 }
-for (const i of [19, 20, 127]) assert.equal(paletteAfter[i], paletteBefore[i]);
+const changingColors = new Set();
+for (const start of [...cyclicStarts, run('GLASS_PALETTE_START')]) {
+  for (let i = 0; i < 8; ++i) changingColors.add(start + i);
+}
+for (let i = 0; i < 256; ++i) {
+  if (!changingColors.has(i)) assert.equal(paletteAfter[i], paletteBefore[i], `palette ${i} stays fixed`);
+}
 assert.equal(run('glassPulseMs'), 60);
+// 遅れたフレームでも専用8色だけが明るい端まで進み、一周期で元の青に戻ります。
+run('deltaTime = 660');
+api.draw();
+assert.equal(run('glassPulseMs'), 720);
+const brightColors = Array.from(run('GLASS_LIGHT_COLORS'), color => Array.from(color));
+const brightBytes = Buffer.from(run('palette32').buffer);
+for (let shade = 0; shade < 8; ++shade) {
+  assert.deepEqual(Array.from(brightBytes.subarray((216 + shade) * 4, (216 + shade) * 4 + 3)), brightColors[shade]);
+}
+run('deltaTime = 720');
+api.draw();
+assert.equal(run('glassPulseMs'), 0);
+assert.deepEqual(Array.from(run('palette32')), paletteBefore, 'all animated ranges return after a full cycle');
 events['reset:click']();
 state = api.state();
 assert.equal(state.speed, 8 * FIXED);
